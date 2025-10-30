@@ -1,0 +1,1 @@
+cd ~/Desktop/Discord_Bot; source venv/bin/activate; python GramaBot25.py 2>/dev/null

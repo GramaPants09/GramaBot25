@@ -1,0 +1,24 @@
+# Python cache
+__pycache__/
+*.pyc
+
+# Virtual environment
+venv/
+
+# VS Code stuff
+.vscode/
+
+.env
+
+# Audio and large files
+audio/*
+!audio/.gitkeep
+
+# Keep Json file but get rid of contents
+cogs/jsonfiles/*
+!cogs/jsonfiles/.gitkeep
+
+
+# Logs and temp files
+*.log
+*.tmp
