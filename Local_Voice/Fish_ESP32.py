@@ -7,7 +7,7 @@ import os
 from dotenv import load_dotenv
 
 # ESP32_IP = os.getenv("ESP32_IP")
-ESP32_IP="192.168.0.53"
+ESP32_IP="192.168.0.192"
 URL = f"ws://{ESP32_IP}:81"
 
 async def send_test_action(part, state, duration=2000):

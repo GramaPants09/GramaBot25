@@ -28,7 +28,7 @@ class BlacklistBot(commands.Cog):
 
         # Blacklist a random word (timestamped)
         random_word = random.choice(word_candidates)
-        self.blacklisted_words[random_word] = datetime.utcnow()
+        self.blacklisted_words[random_word] = datetime.now()
 
         # Console output
         print(f"[BLACKLISTED] '{random_word}' is now blacklisted.")
@@ -45,7 +45,7 @@ class BlacklistBot(commands.Cog):
         self.blacklisted_words.clear()
 
         forgiven_words = ', '.join(f"**{w}**" for w in forgiven)
-        await ctx.send(f":dove:" + OutputText.output(ctx.guild.id,"All is forgiven. The following words are no longer forbidden: {forgiven_words}"))
+        await ctx.send(f":dove:" + OutputText.output(ctx.guild.id,f"All is forgiven. The following words are no longer forbidden: {forgiven_words}"))
 
     @commands.Cog.listener()
     async def on_message(self, message):
@@ -63,8 +63,8 @@ class BlacklistBot(commands.Cog):
                     )
 
                     # Set timeout (mute) for 5 seconds
-                    until = datetime.utcnow() + timedelta(seconds=5)
-                    await message.author.edit(communication_disabled_until=until)
+                    until = datetime.now() + timedelta(seconds=5)
+                    await message.author.edit(timed_out_until=until)
 
                 except discord.Forbidden:
                     await message.channel.send("I don't have permission to punish people.")

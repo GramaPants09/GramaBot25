@@ -31,8 +31,11 @@ class RespondInChat(commands.Cog):
             await message.channel.send("Fine. Be that way.")
             return
 
-        wake_words = ["gramabot", "jarvis", "gb", "<@1353470673498013707>"]
-        randomly_join_chance =random.randint(0,1000) 
+        
+        # wake_words = ["gramabot", "jarvis", "gb", "<@1353470673498013707>"]
+        wake_words = ["<@1353470673498013707>"]
+        # randomly_join_chance =random.randint(0,1000) 
+        randomly_join_chance = 60 #this line makes it so it never activates
 
         # Wake word ? start listening for this channel
         if any(w in message.content.lower() for w in wake_words) or randomly_join_chance < 10:

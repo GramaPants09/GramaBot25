@@ -2,6 +2,10 @@ import discord
 import asyncio
 from discord.ext import commands, tasks
 from datetime import datetime, timedelta
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None
 import random
 import OutputText
 import json
@@ -37,6 +41,7 @@ class Ranked_Aura(commands.Cog):
         await ctx.send("Forcing daily aura update...")
         await self.timed_scoreboard.__call__()
 
+    # Decides what aura to set to each person, returns aura
     async def decide_aura(self, guild_id, user_id):
         aura_manager = self.client.get_cog("Aura_Manager")
         if aura_manager is None:
@@ -114,19 +119,19 @@ class Ranked_Aura(commands.Cog):
                 user_id = str(member.id)
                 user_data = server_data.setdefault(user_id, {"Username": member.name, "ScoreHistory": [0]})
 
-                # Maintain a 7-day history
-                history = user_data.get("ScoreHistory", [])
+                # Load and normalize history (pad to 7 days if needed)
+                history = user_data.get("ScoreHistory", [0]) or [0]
                 if len(history) < 7:
                     history = [history[0]] * (7 - len(history)) + history
-                history = history[1:] + [history[-1]]
-                user_data["ScoreHistory"] = history
 
-                # Calculate daily change
+                # Calculate daily change and update aura first
                 daily_change = await self.decide_aura(channel.guild.id, member.id)
                 await aura_manager.add_aura(channel.guild.id, member.id, daily_change)
-
                 updated_aura = await aura_manager.get_aura(channel.guild.id, member.id)
-                user_data["ScoreHistory"][-1] = updated_aura
+
+                # Shift history (push older days back) and append today's updated aura
+                new_history = history[1:] + [updated_aura]
+                user_data["ScoreHistory"] = new_history
 
                 # Prepare message
                 if daily_change > 0 and self.normal_change:
@@ -158,12 +163,22 @@ class Ranked_Aura(commands.Cog):
     @timed_scoreboard.before_loop
     async def before_timed_scoreboard(self):
         await self.client.wait_until_ready()
-        now = datetime.now()
         hour, minute = self.daily_scoreboard_time
-        target_time = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-        if now >= target_time:
-            target_time += timedelta(days=1)
-        wait_seconds = (target_time - now).total_seconds()
+        # Use America/Los_Angeles (PST/PDT) if available to compute next midnight PST correctly
+        if ZoneInfo is not None:
+            now = datetime.now(ZoneInfo("America/Los_Angeles"))
+            target_time = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if now >= target_time:
+                target_time = target_time + timedelta(days=1)
+            # compute wait in local (server) seconds by converting to UTC naive then to timestamp
+            wait_seconds = (target_time - now).total_seconds()
+        else:
+            # Fallback: use server local time
+            now = datetime.now()
+            target_time = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if now >= target_time:
+                target_time += timedelta(days=1)
+            wait_seconds = (target_time - now).total_seconds()
         print(f"? Waiting {int(wait_seconds)} seconds until next aura drop at {hour:02d}:{minute:02d}")
         await asyncio.sleep(wait_seconds)
 
@@ -218,8 +233,8 @@ class Ranked_Aura(commands.Cog):
 
         def user_color(uid):
             seed = int(hashlib.md5(uid.encode()).hexdigest(), 16)
-            random.seed(seed)
-            return random.choice(list(mcolors.TABLEAU_COLORS.values()) + list(mcolors.CSS4_COLORS.values()))
+            rng = random.Random(seed)
+            return rng.choice(list(mcolors.TABLEAU_COLORS.values()) + list(mcolors.CSS4_COLORS.values()))
 
         today = datetime.now().weekday()
         all_days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]

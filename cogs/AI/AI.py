@@ -4,7 +4,7 @@ import os
 from dotenv import load_dotenv
 import json
 import asyncio
-import google.generativeai as genai
+import ollama 
 import OutputText
 
 load_dotenv()
@@ -13,16 +13,19 @@ load_dotenv()
 MEMORY_FILE = "cogs/jsonfiles/memory.json"
 AUDIO_DIR = "/home/gramapants/Desktop/Discord_Bot/audio"
 WAKE_CHANNEL_ID = 1373846484683853885
-AI_KEY = os.getenv("AI_KEY")
-
 
 # Ensure directory exists
 os.makedirs(AUDIO_DIR, exist_ok=True)
+
+LOCAL_MODEL = "qwen2.5:1.5b"
+OLLAMA_API = "http://localhost:11434/api/generate"
 
 class AI(commands.Cog):
     def __init__(self, client):
         self.client = client
         self.memory = self.load_memory()
+        # self.ollama = Ollama()
+
 
         if client is not None:
             self.loop = asyncio.get_event_loop()
@@ -44,12 +47,9 @@ class AI(commands.Cog):
             json.dump(self.memory, f, indent=4)
 
     async def generate(self, user_id, prompt, in_chat=False):
-        genai.configure(api_key=AI_KEY)
-       #
-       #  model = genai.GenerativeModel("gemini-1.5-flash")
-        model = genai.GenerativeModel("gemini-2.0-flash-lite")
-
-        has_custom_prompt = ["448854769306435584", "418946699965497355", "1135674124585410662", "691050015078219786", "915043571940343919", "525799573445410817", "chat"]
+        # Same custom prompts logic
+        has_custom_prompt = ["448854769306435584", "418946699965497355", "1135674124585410662",
+                             "691050015078219786", "915043571940343919", "525799573445410817", "chat"]
 
         custom_prompts = {
             "448854769306435584": "Never use an asterisk (*). You speak english even as a fish. Dont make fish noises make english noises. Keep your responses concise. Do not narrate your actions. Your name is GramaBot, you call the user sir, you act like jarvis, and you are very very british. Keep it concise but respond accordingly. You are allowed to swear only when asked. You also have the body of a fish, and you hate the idea of a 13 month calander. If someone were to insult you, you flip out and start to swear like a sailor",
@@ -62,15 +62,15 @@ class AI(commands.Cog):
             "chat": "Never use an asterisk (*). You speak english. Do not narrate your actions. Your name is GramaBot, you call the user by their name, you act like jarvis, and you are very very british. Respond accordingly. You are allowed to swear. You are trapped in a discord bot. and you hate the idea of a 13 month calander. If someone were to insult you, you flip out and start to swear like a sailor. Also, get annoyed if someone @'s you (@GramaBot25#7636 ). You are owned and were created by user (448854769306435584) also known as GramaPants09, Aidan, or kaoi sikha"
         }
 
-        # Local user shares memory with user 448854769306435584
+        # Decide effective user ID
         if in_chat:
             effective_user_id = "chat"
-
         else:
             effective_user_id = "default" if str(user_id) == "local_user" or str(user_id) not in has_custom_prompt else str(user_id)
-        
+
         system_prompt = custom_prompts.get(effective_user_id, "You are GramaBot. Respond like Jarvis. Short and concise.")
 
+        # Handle user memory
         user_memory = self.memory.get(effective_user_id, [])
         if effective_user_id != "chat":
             user_memory.append(f"User: {prompt}")
@@ -83,16 +83,27 @@ class AI(commands.Cog):
         self.memory[effective_user_id] = user_memory
         self.save_memory()
 
+        # Combine prompt for Ollama
+        full_prompt = f"{system_prompt}\n" + "\n".join(user_memory)
+
         try:
-            chat = model.start_chat()
-            response = await asyncio.to_thread(chat.send_message, f"{system_prompt}\n" + "\n".join(user_memory))
-            user_memory.append(response.text)
+            async with self.conversation_lock:
+                reply_obj = await asyncio.to_thread(
+                    lambda: ollama.generate(
+                        model=LOCAL_MODEL,
+                        prompt=full_prompt
+                    )
+                )
+            reply = reply_obj.response  # this contains the generated text
+            user_memory.append(reply)
             self.memory[effective_user_id] = user_memory
             self.save_memory()
-            return response.text
+            return reply
         except Exception as e:
             return f"Oops, something went wrong: {e}"
 
+
+    # === COMMANDS ===
     @commands.command()
     async def ask(self, ctx, *, prompt: str):
         response = await self.generate(ctx.author.id, prompt)
@@ -117,13 +128,14 @@ class AI(commands.Cog):
 
     @commands.command(aliases=["gramabot", "gramabot!", "gramabot?", "jarvis", "gb"])
     async def grama_bot(self, ctx, *, prompt):
-        try:
-            response = await self.generate(ctx.author.id, prompt)
-            guild_id = ctx.guild.id if ctx.guild else 0
-            modified_response = OutputText.output(guild_id, response)
-            await ctx.send(modified_response)
-        except Exception as e:
-            await ctx.send(f"Oops, something went wrong: {e}")
+        # try:
+        #     response = await self.generate(ctx.author.id, prompt)
+        #     guild_id = ctx.guild.id if ctx.guild else 0
+        #     modified_response = OutputText.output(guild_id, response)
+        #     await ctx.send(modified_response)
+        # except Exception as e:
+        #     await ctx.send(f"Oops, something went wrong: {e}")
+        await ctx.send("Sorry, this command isn't working right now. Instead, join a voice call and do the command: $monke")
 
     @discord.app_commands.command(name="gramabot", description="Talk to GramaBot like it's Jarvis.")
     async def grama_bot_slash(self, interaction: discord.Interaction, prompt: str):
@@ -139,6 +151,7 @@ class AI(commands.Cog):
     @commands.Cog.listener()
     async def on_load(self):
         await self.client.tree.sync()
+
 
 async def setup(client):
     await client.add_cog(AI(client))
@@ -159,5 +172,3 @@ async def handle_command(command: str, client) -> str:
         return await ai.generate("local_user", command)
     except Exception as e:
         return f"AI fallback error: {e}"
-
-

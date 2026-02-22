@@ -7,6 +7,8 @@ import json
 import os
 import OutputText
 import subprocess
+import random
+from pydub import AudioSegment
 
 QUEUE_FILE = "cogs/jsonfiles/music_queue.json"
 
@@ -51,14 +53,74 @@ class Music(commands.Cog):
         with open(QUEUE_FILE, "w") as f:
             json.dump(self.queue, f)
 
+    @commands.command()
+    async def debugmsg(self, ctx):
+        msg = ctx.message
+
+        lines = [
+            "**?? Raw Message Content:**",
+            f"```{msg.content}```",
+            "",
+            "**?? Channel Mentions (`channel_mentions`):**",
+        ]
+
+        if msg.channel_mentions:
+            for ch in msg.channel_mentions:
+                lines.append(
+                    f"- {ch.name} | id={ch.id} | type={type(ch).__name__}"
+                )
+        else:
+            lines.append("- (none)")
+
+        lines.extend([
+            "",
+            "**?? Message Mentions Dict:**",
+            f"```{msg.mentions}```",
+        ])
+
+        await ctx.send("\n".join(lines))
+
+
     async def ensure_voice(self, ctx):
-        if ctx.author.voice and ctx.author.voice.channel:
-            if not ctx.voice_client:
-                await ctx.author.voice.channel.connect()
-            self.voice_client = ctx.voice_client
-            return True
-        await ctx.send(OutputText.output(ctx.guild.id ,"You're not in a voice channel."))
-        return False
+        target_channel = None
+
+        # 1?? Use mentioned voice channel (#! or # both end up here)
+        if ctx.message.channel_mentions:
+            ch = ctx.message.channel_mentions[0]
+            if isinstance(ch, discord.VoiceChannel):
+                target_channel = ch
+            else:
+                await ctx.send(
+                    OutputText.output(
+                        ctx.guild.id,
+                        "That channel is not a voice channel."
+                    )
+                )
+                return False
+
+        # 2?? Fallback to user's current VC
+        elif ctx.author.voice and ctx.author.voice.channel:
+            target_channel = ctx.author.voice.channel
+
+        else:
+            await ctx.send(
+                OutputText.output(
+                    ctx.guild.id,
+                    "You're not in a voice channel. Mention one like `#!hell hole`."
+                )
+            )
+            return False
+
+        vc = ctx.voice_client
+
+        if vc and vc.is_connected():
+            if vc.channel != target_channel:
+                await vc.move_to(target_channel)
+            self.voice_client = vc
+        else:
+            self.voice_client = await target_channel.connect()
+
+        return True
 
     async def get_stream_url(self, query):
         loop = asyncio.get_event_loop()
@@ -103,9 +165,26 @@ class Music(commands.Cog):
         await ctx.send(embed=embed)
 
     @commands.command()
+    async def monke(self, ctx):
+        await self.play(ctx, query="monkey type beat")
+
+    @commands.command(aliases=["turtle", "fuck", "turt", "jazz"])
+    async def music(self, ctx):
+        await self.play(ctx, query="turtle moaning")
+
+    @commands.command()
     async def play(self, ctx, *, query: str):
         if not await self.ensure_voice(ctx):
             return
+        
+        # Remove channel mentions from query
+        for ch in ctx.message.channel_mentions:
+            query = query.replace(f"<#{ch.id}>", "").strip()
+
+        if not query:
+            await ctx.send(OutputText.output(ctx.guild.id, "No song specified."))
+            return
+
         guild_id = str(ctx.guild.id)
         self.queue.setdefault(guild_id, []).append(query)
         self.save_queue()
@@ -204,45 +283,128 @@ class Music(commands.Cog):
 
     @commands.Cog.listener()
     async def on_voice_state_update(self, member, before, after):
-        # User IDs: (filename, speed)
-        triggers = {
-            448854769306435584: ("audio/meme.mp3", 1.0),               # You
+        """
+        Triggers intro music when a specific user joins,
+        and outro music when they leave a voice channel.
+        """
+
+        spencer_outro = ""
+        rand = random.randint(1,10)
+        # if rand >= 0:
+        if rand == 1:
+            spencer_outro = "audio/Spener_Ding.mp3"
+        else:
+            spencer_outro = "audio/Spener_Ding_fake.mp3"
+
+
+        # --- Intro triggers (existing ones) ---
+        intro_triggers = {
+            448854769306435584: ("audio/newIntroMusic.mp3", 1.0),               # GramaPants09
             915043571940343919: ("audio/vineboom.mp3", 1.0),           # Friend
-            1135674124585410662: ("audio/lullaby.mp3", 2.0),      # Lullaby user
+            1135674124585410662: ("audio/laugh_track.mp3", 1.0),      # spencer user
             691050015078219786: ("audio/fog_horn.mp3", 1.0),
             525799573445410817: ("audio/km.mp3", 1.0)
         }
 
-        if member.id in triggers and after.channel is not None and before.channel != after.channel:
-            meme_file_name, speed = triggers[member.id]
+        # --- Outro triggers (new ones) ---
+        outro_triggers = {
+            448854769306435584: ("audio/outrosong.mp3", 1.0),  # Example outro for same user
+            915043571940343919: ("audio/ryan_outro.mp3", 1.0),
+            1135674124585410662: (spencer_outro, 1.0)
+        }
+
+        
+
+
+        # --------------------------
+        # USER JOINS (INTRO)
+        # --------------------------
+        if member.id in intro_triggers and after.channel is not None and before.channel != after.channel:
+            meme_file_name, speed = intro_triggers[member.id] # meme_file_name is the audio file name
+
+            # random chance for jingle to be reversed, which is funny
+            rand = random.randint(1,50)
+            if rand <= 3:
+            # if rand >= 0:
+                audio_file = AudioSegment.from_file(meme_file_name, format="mp3")
+                reversed_audio = audio_file.reverse()
+                reversed_audio.export("reversed_intro.mp3", format="mp3")
+                meme_file_name = "reversed_intro.mp3"
+
             meme_file = os.path.abspath(meme_file_name)
 
             vc: discord.VoiceClient = discord.utils.get(self.client.voice_clients, guild=member.guild)
 
             if vc is None or not vc.is_connected():
-                channel = after.channel
+                vc = await after.channel.connect()
+
+            if not os.path.exists(meme_file):
+                print(f"[ERROR] Intro file {meme_file} not found.")
+                return
+
+            ffmpeg_opts = {
+                'before_options': '',
+                'options': f'-vn -af "atempo={speed}"'
+            }
+
+            source = discord.FFmpegPCMAudio(meme_file, **ffmpeg_opts)
+
+            def after_playing_intro(error):
+                coro = vc.disconnect()
+                fut = asyncio.run_coroutine_threadsafe(coro, self.client.loop)
+                try:
+                    fut.result()
+                except Exception as e:
+                    print(f"Failed to disconnect after intro: {e}")
+
+            vc.play(source, after=after_playing_intro)
+
+        # --------------------------
+        # USER LEAVES (OUTRO)
+        # --------------------------
+        elif member.id in outro_triggers and before.channel is not None and after.channel is None:
+            meme_file_name, speed = outro_triggers[member.id]
+
+            # random chance for jingle to be reversed, which is funny
+            rand = random.randint(1,50)
+            if rand <= 3:
+            # if rand >= 0:
+                audio_file = AudioSegment.from_file(meme_file_name, format="mp3")
+                reversed_audio = audio_file.reverse()
+                reversed_audio.export("reversed_outro.mp3", format="mp3")
+                meme_file_name = "reversed_outro.mp3"
+
+
+            meme_file = os.path.abspath(meme_file_name)
+
+            if not os.path.exists(meme_file):
+                print(f"[ERROR] Outro file {meme_file} not found.")
+                return
+
+            # Get the channel the user left (so the bot can join)
+            channel = before.channel
+            vc: discord.VoiceClient = discord.utils.get(self.client.voice_clients, guild=member.guild)
+
+            if vc is None or not vc.is_connected():
                 vc = await channel.connect()
 
-                if not os.path.exists(meme_file):
-                    print(f"[ERROR] Meme file {meme_file} not found.")
-                    return
+            ffmpeg_opts = {
+                'before_options': '',
+                'options': f'-vn -af "atempo={speed}"'
+            }
 
-                ffmpeg_opts = {
-                    'before_options': '',
-                    'options': f'-vn -af "atempo={speed}"'
-                }
+            source = discord.FFmpegPCMAudio(meme_file, **ffmpeg_opts)
 
-                source = discord.FFmpegPCMAudio(meme_file, **ffmpeg_opts)
+            def after_playing_outro(error):
+                coro = vc.disconnect()
+                fut = asyncio.run_coroutine_threadsafe(coro, self.client.loop)
+                try:
+                    fut.result()
+                except Exception as e:
+                    print(f"Failed to disconnect after outro: {e}")
 
-                def after_playing(error):
-                    coro = vc.disconnect()
-                    fut = asyncio.run_coroutine_threadsafe(coro, self.client.loop)
-                    try:
-                        fut.result()
-                    except Exception as e:
-                        print(f"Failed to disconnect: {e}")
+            vc.play(source, after=after_playing_outro)
 
-                vc.play(source, after=after_playing)
 
     async def play_song_local(self, query):
         try:
