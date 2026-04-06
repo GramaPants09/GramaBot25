@@ -1,13 +1,16 @@
 import discord
 from discord.ext import commands
 import os
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 import json
 import asyncio
-import ollama 
+from groq import Groq
 import OutputText
 
-load_dotenv()
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+load_dotenv(os.path.join(ROOT_DIR, ".env"), override=True)
+load_dotenv(find_dotenv(usecwd=True), override=True)
+load_dotenv(override=True)
 
 # Config
 MEMORY_FILE = "cogs/jsonfiles/memory.json"
@@ -17,8 +20,17 @@ WAKE_CHANNEL_ID = 1373846484683853885
 # Ensure directory exists
 os.makedirs(AUDIO_DIR, exist_ok=True)
 
-LOCAL_MODEL = "qwen2.5:1.5b"
-OLLAMA_API = "http://localhost:11434/api/generate"
+GROQ_MODEL = "llama-3.3-70b-versatile"
+LOCAL_TTS_OWNER_ID = 448854769306435584
+
+
+def resolve_api_key() -> str:
+    key = (
+        os.getenv("GROQ_API_KEY")
+        or os.getenv("GramaBot_API_KEY")
+        or os.getenv("OPENROUTER_API_KEY")
+    )
+    return (key or "").strip().strip('"').strip("'")
 
 class AI(commands.Cog):
     def __init__(self, client):
@@ -45,6 +57,27 @@ class AI(commands.Cog):
     def save_memory(self):
         with open(MEMORY_FILE, "w") as f:
             json.dump(self.memory, f, indent=4)
+
+    def _should_use_local_tts(self, user_id) -> bool:
+        return str(user_id) == str(LOCAL_TTS_OWNER_ID)
+
+    def _speak_response_locally(self, user_id, text):
+        if not self._should_use_local_tts(user_id):
+            return
+
+        clean_text = (text or "").strip()
+        if not clean_text:
+            return
+
+        asyncio.create_task(self._run_local_tts(clean_text))
+
+    async def _run_local_tts(self, text: str):
+        try:
+            from Local_Voice.speak_pipeline import speak_text_with_fish
+
+            await speak_text_with_fish(text, play_ding=False)
+        except Exception as e:
+            print(f"[AI Local TTS] {e}")
 
     async def generate(self, user_id, prompt, in_chat=False):
         # Same custom prompts logic
@@ -83,24 +116,50 @@ class AI(commands.Cog):
         self.memory[effective_user_id] = user_memory
         self.save_memory()
 
-        # Combine prompt for Ollama
-        full_prompt = f"{system_prompt}\n" + "\n".join(user_memory)
+        # Build messages for Groq API
+        messages = [{"role": "system", "content": system_prompt}]
+        for memory_item in user_memory:
+            if memory_item.startswith("User:"):
+                messages.append({"role": "user", "content": memory_item.replace("User: ", "", 1)})
+            else:
+                messages.append({"role": "assistant", "content": memory_item})
 
         try:
             async with self.conversation_lock:
-                reply_obj = await asyncio.to_thread(
-                    lambda: ollama.generate(
-                        model=LOCAL_MODEL,
-                        prompt=full_prompt
-                    )
+                response = await asyncio.to_thread(
+                    self._call_groq,
+                    messages
                 )
-            reply = reply_obj.response  # this contains the generated text
-            user_memory.append(reply)
+            user_memory.append(response)
             self.memory[effective_user_id] = user_memory
             self.save_memory()
-            return reply
+            return response
         except Exception as e:
             return f"Oops, something went wrong: {e}"
+
+    def _call_groq(self, messages):
+        """Synchronous wrapper for Groq API call"""
+        try:
+            api_key = resolve_api_key()
+
+            if not api_key:
+                raise Exception("Missing API key. Set GROQ_API_KEY in .env (or GramaBot_API_KEY)")
+            if not api_key.startswith("gsk_"):
+                raise Exception("Invalid Groq API key format. Groq keys start with 'gsk_'. Set GROQ_API_KEY to your Groq key.")
+
+            client = Groq(api_key=api_key)
+            
+            response = client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=messages,
+                temperature=0.7,
+                max_tokens=500
+            )
+            
+            return response.choices[0].message.content
+        except Exception as e:
+            error_msg = str(e)
+            raise Exception(f"Groq API error: {error_msg}")
 
 
     # === COMMANDS ===
@@ -108,6 +167,7 @@ class AI(commands.Cog):
     async def ask(self, ctx, *, prompt: str):
         response = await self.generate(ctx.author.id, prompt)
         await ctx.send(response)
+        self._speak_response_locally(ctx.author.id, response)
 
     @commands.command(name="reset_ai")
     async def reset_ai(self, ctx):
@@ -128,14 +188,15 @@ class AI(commands.Cog):
 
     @commands.command(aliases=["gramabot", "gramabot!", "gramabot?", "jarvis", "gb"])
     async def grama_bot(self, ctx, *, prompt):
-        # try:
-        #     response = await self.generate(ctx.author.id, prompt)
-        #     guild_id = ctx.guild.id if ctx.guild else 0
-        #     modified_response = OutputText.output(guild_id, response)
-        #     await ctx.send(modified_response)
-        # except Exception as e:
-        #     await ctx.send(f"Oops, something went wrong: {e}")
-        await ctx.send("Sorry, this command isn't working right now. Instead, join a voice call and do the command: $monke")
+        try:
+            response = await self.generate(ctx.author.id, prompt)
+            guild_id = ctx.guild.id if ctx.guild else 0
+            modified_response = OutputText.output(guild_id, response)
+            await ctx.send(modified_response)
+            self._speak_response_locally(ctx.author.id, modified_response)
+        except Exception as e:
+            await ctx.send(f"Oops, something went wrong: {e}")
+        # await ctx.send("Sorry, this command isn't working right now. Instead, join a voice call and do the command: $monke")
 
     @discord.app_commands.command(name="gramabot", description="Talk to GramaBot like it's Jarvis.")
     async def grama_bot_slash(self, interaction: discord.Interaction, prompt: str):
@@ -145,6 +206,7 @@ class AI(commands.Cog):
             guild_id = interaction.guild.id if interaction.guild else 0
             modified_response = OutputText.output(guild_id, response)
             await interaction.followup.send(modified_response)
+            self._speak_response_locally(interaction.user.id, modified_response)
         except Exception as e:
             await interaction.followup.send(f"Oops, something went wrong: {e}")
 
