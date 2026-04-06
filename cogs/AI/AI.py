@@ -4,7 +4,7 @@ import os
 from dotenv import load_dotenv, find_dotenv
 import json
 import asyncio
-from groq import Groq
+from openrouter import OpenRouter
 import OutputText
 
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -20,15 +20,15 @@ WAKE_CHANNEL_ID = 1373846484683853885
 # Ensure directory exists
 os.makedirs(AUDIO_DIR, exist_ok=True)
 
-GROQ_MODEL = "llama-3.3-70b-versatile"
+OPENROUTER_MODEL = "meta-llama/llama-3.3-70b-instruct:free"
 LOCAL_TTS_OWNER_ID = 448854769306435584
 
 
 def resolve_api_key() -> str:
     key = (
-        os.getenv("GROQ_API_KEY")
+        os.getenv("OPEN_ROUTER_API_KEY")
         or os.getenv("GramaBot_API_KEY")
-        or os.getenv("OPENROUTER_API_KEY")
+        or os.getenv("GROQ_API_KEY")
     )
     return (key or "").strip().strip('"').strip("'")
 
@@ -116,7 +116,7 @@ class AI(commands.Cog):
         self.memory[effective_user_id] = user_memory
         self.save_memory()
 
-        # Build messages for Groq API
+        # Build messages for OpenRouter API
         messages = [{"role": "system", "content": system_prompt}]
         for memory_item in user_memory:
             if memory_item.startswith("User:"):
@@ -127,7 +127,7 @@ class AI(commands.Cog):
         try:
             async with self.conversation_lock:
                 response = await asyncio.to_thread(
-                    self._call_groq,
+                    self._call_openrouter,
                     messages
                 )
             user_memory.append(response)
@@ -137,30 +137,52 @@ class AI(commands.Cog):
         except Exception as e:
             return f"Oops, something went wrong: {e}"
 
-    def _call_groq(self, messages):
-        """Synchronous wrapper for Groq API call"""
+    def _call_openrouter(self, messages):
+        """Synchronous wrapper for OpenRouter API call"""
         try:
             api_key = resolve_api_key()
 
             if not api_key:
-                raise Exception("Missing API key. Set GROQ_API_KEY in .env (or GramaBot_API_KEY)")
-            if not api_key.startswith("gsk_"):
-                raise Exception("Invalid Groq API key format. Groq keys start with 'gsk_'. Set GROQ_API_KEY to your Groq key.")
+                raise Exception("Missing API key. Set OPENROUTER_API_KEY (or GramaBot_API_KEY) in .env")
 
-            client = Groq(api_key=api_key)
-            
-            response = client.chat.completions.create(
-                model=GROQ_MODEL,
+            client = OpenRouter(api_key=api_key)
+            response = client.chat.send(
+                model=OPENROUTER_MODEL,
                 messages=messages,
                 temperature=0.7,
                 max_tokens=500
             )
-            
-            return response.choices[0].message.content
+
+            if hasattr(response, "choices") and response.choices:
+                return response.choices[0].message.content
+            if hasattr(response, "content") and response.content:
+                first = response.content[0]
+                return first.text if hasattr(first, "text") else str(first)
+
+            return str(response)
         except Exception as e:
             error_msg = str(e)
-            raise Exception(f"Groq API error: {error_msg}")
+            raise Exception(f"OpenRouter API error: {error_msg}")
 
+
+    @commands.Cog.listener()
+    async def on_message(self, message):
+        #Ignore own messages
+        if message.author.id == self.client.user.id:
+            return
+
+        # If another bot mentions me, respond in chat mode
+        if message.author.bot and self.client.user.mentioned_in(message):
+            clean = message.clean_content.replace(f"@{self.client.user.display_name}", "").strip()
+
+            if not clean:
+                return
+
+            prompt = f"{message.author.display_name} says: {clean}"
+            response = await self.generate("chat", prompt, in_chat=True)
+
+    #Mention the bot back so Darwin picks it up
+            await message.channel.send(f"<@{message.author.id}> {response}")
 
     # === COMMANDS ===
     @commands.command()
