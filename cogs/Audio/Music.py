@@ -168,6 +168,58 @@ class Music(commands.Cog):
     async def monke(self, ctx):
         await self.play(ctx, query="monkey type beat")
 
+    @commands.command(aliases=["depressed", "sadboy", "sadboi"])
+    async def sad(self, ctx):
+        # Use the same intro-style local playback logic: join VC, play file, then disconnect
+        member = ctx.author
+        if not member.voice or not member.voice.channel:
+            await ctx.send(OutputText.output(ctx.guild.id, "You're not in a voice channel."))
+            return
+
+        meme_file_name = "audio/music.mp3"
+        speed = 1.0
+
+        # random chance to reverse the clip (keeps behavior consistent with intro triggers)
+        rand = random.randint(1, 50)
+        if rand <= 3:
+            try:
+                audio_file = AudioSegment.from_file(meme_file_name, format="mp3")
+                reversed_audio = audio_file.reverse()
+                reversed_audio.export("reversed_sad.mp3", format="mp3")
+                meme_file_name = "reversed_sad.mp3"
+            except Exception as e:
+                print(f"Error creating reversed clip: {e}")
+
+        meme_file = os.path.abspath(meme_file_name)
+
+        vc: discord.VoiceClient = discord.utils.get(self.client.voice_clients, guild=member.guild)
+
+        if vc is None or not vc.is_connected():
+            vc = await member.voice.channel.connect()
+
+        if not os.path.exists(meme_file):
+            await ctx.send(OutputText.output(ctx.guild.id, f"Audio file not found: {meme_file_name}"))
+            return
+
+        ffmpeg_opts = {
+            'before_options': '',
+            'options': f'-vn -af "atempo={speed}"'
+        }
+
+        def after_playing_sad(error):
+            coro = vc.disconnect()
+            fut = asyncio.run_coroutine_threadsafe(coro, self.client.loop)
+            try:
+                fut.result()
+            except Exception as e:
+                print(f"Failed to disconnect after sad clip: {e}")
+
+        source = discord.FFmpegPCMAudio(meme_file, **ffmpeg_opts)
+        vc.play(source, after=after_playing_sad)
+
+        embed = discord.Embed(title="Now Playing", description="Local: music.mp3", color=discord.Color.green())
+        await ctx.send(embed=embed)
+
     @commands.command(aliases=["turtle", "fuck", "turt", "jazz"])
     async def music(self, ctx):
         await self.play(ctx, query="turtle moaning")

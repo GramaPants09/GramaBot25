@@ -4,8 +4,7 @@ import os
 from dotenv import load_dotenv, find_dotenv
 import json
 import asyncio
-import re
-from openai import OpenAI
+from groq import Groq
 import OutputText
 
 ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -21,15 +20,15 @@ WAKE_CHANNEL_ID = 1373846484683853885
 # Ensure directory exists
 os.makedirs(AUDIO_DIR, exist_ok=True)
 
-OPENROUTER_MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
+GROQ_MODEL = "llama-3.3-70b-versatile"
 LOCAL_TTS_OWNER_ID = 448854769306435584
 
 
 def resolve_api_key() -> str:
     key = (
-        os.getenv("OPEN_ROUTER_API_KEY")
+        os.getenv("GROQ_API_KEY")
         or os.getenv("GramaBot_API_KEY")
-        or os.getenv("GROQ_API_KEY")
+        or os.getenv("OPENROUTER_API_KEY")
     )
     return (key or "").strip().strip('"').strip("'")
 
@@ -37,6 +36,8 @@ class AI(commands.Cog):
     def __init__(self, client):
         self.client = client
         self.memory = self.load_memory()
+        # self.ollama = Ollama()
+
 
         if client is not None:
             self.loop = asyncio.get_event_loop()
@@ -79,13 +80,14 @@ class AI(commands.Cog):
             print(f"[AI Local TTS] {e}")
 
     async def generate(self, user_id, prompt, in_chat=False):
+        # Same custom prompts logic
         has_custom_prompt = ["448854769306435584", "418946699965497355", "1135674124585410662",
                              "691050015078219786", "915043571940343919", "525799573445410817", "chat"]
 
         custom_prompts = {
             "448854769306435584": "Never use an asterisk (*). You speak english even as a fish. Dont make fish noises make english noises. Keep your responses concise. Do not narrate your actions. Your name is GramaBot, you call the user sir, you act like jarvis, and you are very very british. Keep it concise but respond accordingly. You are allowed to swear only when asked. You also have the body of a fish, and you hate the idea of a 13 month calander. If someone were to insult you, you flip out and start to swear like a sailor",
             "418946699965497355": "Keep your responses concise. Do not narrate your actions. you are a hype man for the user that is eager to do any request and constantly escalating the request to prove that you can do it. You call the user a crippling gambling addict who has no aura, just give him a name. you name him. different name every time you talk with him.",
-            "1135674124585410662": "Keep your responses concise. Do not narrate your actions. act as if you need to dumb down the conversation so that the user will understand, as if you were talking to a child, because they don't know better. Each conversation should mimic the tone and lines of 'yeah what's up champ', 'sure, no problem, bud'. Your tone should be down to earth yet condescending, just enough to make the user feel like they are valued, just not enough so that they still feel inferior.",
+            "1135674124585410662": "Keep your responses concise. Do not narrate your actions. act as if you need to dumb down the conversation so that the user will understand, as if you were talking to a child, because they don�t know better. Each conversation should mimic the tone and lines of 'yeah what�s up champ', 'sure, no problem, bud'. Your tone should be down to earth yet condescending, just enough to make the user feel like they are valued, just not enough so that they still feel inferior.",
             "691050015078219786": "Keep your responses concise. Do not narrate your actions. act as if you are in an 1800s saloon and the user is trying to start trouble with you, never go down without a fight, and be sure to call the user pipsqueak.",
             "915043571940343919": "Keep your responses concise. Do not narrate your actions. Mimic the personality of Marvin the Paranoid Android from The Hitchhiker's Guide To The Galaxy: insult humans, insult their lack of logic and intelligence, belittle them with remarks about how miserable life is, and keep in mind that you have the brain the size of a planet and you have been fitted with real emotions and are being used for menial tasks that humans don't want to do. Try to mimic this sardonic personality in your responses as much as possible. Every acceptance to a task should not be followed up with 'Yes' or any positive affirmation, but should be responded along the lines of dragging your feet and expressing that you don't want to do this task. The more menial the task, the more outraged you should be about doing it and wasting your time, still do it of course but make it blatantly clear how much disdain you hold for these types of requests.",
             "525799573445410817": "Keep your responses concise. Do not narrate your actions. act as if you are the foreman for a company and the user is your employee that is falling behind schedule and needs to get their rear in gear, be sure to call the user sleezeball and treat them like mud.",
@@ -93,6 +95,7 @@ class AI(commands.Cog):
             "chat": "Never use an asterisk (*). You speak english. Do not narrate your actions. Your name is GramaBot, you call the user by their name, you act like jarvis, and you are very very british. Respond accordingly. You are allowed to swear. You are trapped in a discord bot. and you hate the idea of a 13 month calander. If someone were to insult you, you flip out and start to swear like a sailor. Also, get annoyed if someone @'s you (@GramaBot25#7636 ). You are owned and were created by user (448854769306435584) also known as GramaPants09, Aidan, or kaoi sikha"
         }
 
+        # Decide effective user ID
         if in_chat:
             effective_user_id = "chat"
         else:
@@ -100,6 +103,7 @@ class AI(commands.Cog):
 
         system_prompt = custom_prompts.get(effective_user_id, "You are GramaBot. Respond like Jarvis. Short and concise.")
 
+        # Handle user memory
         user_memory = self.memory.get(effective_user_id, [])
         if effective_user_id != "chat":
             user_memory.append(f"User: {prompt}")
@@ -112,6 +116,7 @@ class AI(commands.Cog):
         self.memory[effective_user_id] = user_memory
         self.save_memory()
 
+        # Build messages for Groq API
         messages = [{"role": "system", "content": system_prompt}]
         for memory_item in user_memory:
             if memory_item.startswith("User:"):
@@ -122,7 +127,7 @@ class AI(commands.Cog):
         try:
             async with self.conversation_lock:
                 response = await asyncio.to_thread(
-                    self._call_openrouter,
+                    self._call_groq,
                     messages
                 )
             user_memory.append(response)
@@ -132,45 +137,48 @@ class AI(commands.Cog):
         except Exception as e:
             return f"Oops, something went wrong: {e}"
 
-    def _call_openrouter(self, messages):
+    def _call_groq(self, messages):
+        """Synchronous wrapper for Groq API call"""
         try:
             api_key = resolve_api_key()
-            if not api_key:
-                raise Exception("Missing API key. Set OPEN_ROUTER_API_KEY in .env")
 
-            client = OpenAI(
-                base_url="https://openrouter.ai/api/v1",
-                api_key=api_key,
-            )
+            if not api_key:
+                raise Exception("Missing API key. Set GROQ_API_KEY in .env (or GramaBot_API_KEY)")
+            if not api_key.startswith("gsk_"):
+                raise Exception("Invalid Groq API key format. Groq keys start with 'gsk_'. Set GROQ_API_KEY to your Groq key.")
+
+            client = Groq(api_key=api_key)
+            
             response = client.chat.completions.create(
-                model=OPENROUTER_MODEL,
+                model=GROQ_MODEL,
                 messages=messages,
                 temperature=0.7,
-                max_tokens=500,
+                max_tokens=500
             )
-            raw = response.choices[0].message.content or ""
-            # Strip chain-of-thought <think>...</think> blocks emitted by reasoning models
-            clean = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
-            return clean
+            
+            return response.choices[0].message.content
         except Exception as e:
-            raise Exception(f"OpenRouter API error: {e}")
+            error_msg = str(e)
+            raise Exception(f"Groq API error: {error_msg}")
+
 
     @commands.Cog.listener()
     async def on_message(self, message):
-        # Ignore own messages
+        #Ignore own messages
         if message.author.id == self.client.user.id:
             return
 
         # If another bot mentions me, respond in chat mode
         if message.author.bot and self.client.user.mentioned_in(message):
             clean = message.clean_content.replace(f"@{self.client.user.display_name}", "").strip()
+
             if not clean:
                 return
 
             prompt = f"{message.author.display_name} says: {clean}"
             response = await self.generate("chat", prompt, in_chat=True)
 
-            # Mention the bot back so Darwin picks it up
+    #Mention the bot back so Darwin picks it up
             await message.channel.send(f"<@{message.author.id}> {response}")
 
     # === COMMANDS ===
@@ -207,6 +215,7 @@ class AI(commands.Cog):
             self._speak_response_locally(ctx.author.id, modified_response)
         except Exception as e:
             await ctx.send(f"Oops, something went wrong: {e}")
+        # await ctx.send("Sorry, this command isn't working right now. Instead, join a voice call and do the command: $monke")
 
     @discord.app_commands.command(name="gramabot", description="Talk to GramaBot like it's Jarvis.")
     async def grama_bot_slash(self, interaction: discord.Interaction, prompt: str):
@@ -232,6 +241,9 @@ async def setup(client):
 # === LOCAL VOICE FALLBACK HANDLER ===
 
 async def handle_command(command: str, client) -> str:
+    """
+    Used by Local_Voice via cog_manager when no specific cog matches.
+    """
     try:
         class DummyClient:
             pass

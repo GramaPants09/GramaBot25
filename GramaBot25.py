@@ -19,8 +19,8 @@ import threading
 import json
 import asyncio
 import discord
-if not discord.opus.is_loaded():
-    discord.opus.load_opus("libopus.so.0")
+# if not discord.opus.is_loaded():
+discord.opus.load_opus("libopus.so.0")
 from discord.ext import commands
 from Local_Voice.main import voice_loop_entrypoint
 

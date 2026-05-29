@@ -1,102 +1,107 @@
 import os
-import pronouncing
+import warnings
 import json
+import re
 from Local_Voice.Fish_ESP32 import fish_performance_test
 import asyncio
+
+with warnings.catch_warnings():
+    warnings.filterwarnings(
+        "ignore",
+        message="pkg_resources is deprecated as an API.*",
+        category=UserWarning,
+    )
+    # import pronouncing
 
 
 TIMINGS_JSON = r"/home/gramapants/Desktop/Discord_Bot/Local_Voice/tts/tts_output_timings/timings.json"
 
 
-def main():
+def _clean_word(word: str) -> str:
+    return re.sub(r"[^a-zA-Z']", "", (word or "")).strip().lower()
 
-    #===================================| Seperate words and timings from json |===================#
-    begin_times = []
-    end_times= []
-    words = []
-    phonemes = []
-    
-    
+
+def build_movement_script(timings_json_path=TIMINGS_JSON):
+
     try:
-        with open(TIMINGS_JSON, "r") as f:
+        with open(timings_json_path, "r") as f:
             json_file = json.load(f)
     except Exception as e:
-        print(f"Faild to load {TIMINGS_JSON}: {e}")
+        print(f"Faild to load {timings_json_path}: {e}")
+        return []
 
-    # Loop through each word
-    for i in range(len(json_file["fragments"])):
-        word = str(json_file["fragments"][i]["lines"]).replace("[","").replace("]","").replace("'","") #
-        begin_time = float(json_file["fragments"][i]["begin"])
-        end_time = float(json_file["fragments"][i]["end"])
-        
-        words.append(word)
-        begin_times.append(begin_time)
-        end_times.append(end_time)
-    
-    #===================================| split words into phones |===================#
-    print(words)
-    for i in range(len(words)):
-        words[i]=pronouncing.phones_for_word(words[i])
-        if len(words[i]) >= 1:
-            phonemes.append(words[i][0])
+    timing_entries = []
+    for fragment in json_file.get("fragments", []):
+        raw_word = str(fragment.get("lines", "")).replace("[", "").replace("]", "").strip()
+        word = _clean_word(raw_word)
+        if not word:
+            continue
 
-        # print(f"Word: {phonemes[i]}, Begin time: {begin_times[i]}, End time: {end_times[i]}")
-    print("phonemes:",phonemes)
-    
-    #===================================| split phonemes with timings|========================
-    
-    vowels = ['A','E','I','O','U']
+        begin_time = float(fragment.get("begin", 0.0))
+        end_time = float(fragment.get("end", begin_time))
+        found_phonemes = pronouncing.phones_for_word(word.lower())
+        timing_entries.append((word, begin_time, end_time, found_phonemes[0] if found_phonemes else None))
+
+    print([entry[0] for entry in timing_entries])
+    print("phonemes:", [entry[3] for entry in timing_entries])
+
+    vowels = ['A', 'E', 'I', 'O', 'U']
     delay = 0
     script = []
     total_time = 0
-    for i in range(len(phonemes)):
-        mouth_open = False
-        begin_time = begin_times[i]
-        end_time = end_times[i]
-        delta_time = (end_time-begin_time) * 1000 # times 1000 because esp32 takes time in ms, not sec.
-        total_time+=delta_time
 
-        # splits each word into phonemes
-        phoneme = phonemes[i].split(" ")
+    for word, begin_time, end_time, phoneme_string in timing_entries:
+        delta_time = max((end_time - begin_time) * 1000, 1)
+        total_time += delta_time
 
-        #print("phoneme",phoneme)
-        time_per_chunk = delta_time/len(phoneme)
+        if phoneme_string:
+            phoneme_chunks = phoneme_string.split(" ")
+        else:
+            estimated_chunks = max(1, min(len(word) // 2, 4))
+            phoneme_chunks = [word] * estimated_chunks
 
-        for chunk in phoneme:
+        time_per_chunk = delta_time / max(len(phoneme_chunks), 1)
 
-            for letter in chunk:
-                if letter in vowels:
-                    mouth_open = True
-                    break
-                else:
-                    mouth_open = False
+        for chunk in phoneme_chunks:
+            mouth_open = any(letter in vowels for letter in chunk)
             print(f"Chunk: {chunk}, mouth open: {mouth_open}, time per chunk: {time_per_chunk}")
 
-            # Sets up script for mouth movement
-            part = "mouth"
-            state = "open" if mouth_open else "close"
-            duration = time_per_chunk
-            delay+=time_per_chunk
+            script.append({
+                "part": "mouth",
+                "state": "open" if mouth_open else "close",
+                "duration": time_per_chunk,
+                "delay": delay,
+            })
+            delay += time_per_chunk
 
-            move = {"part": part, "state": state, "duration": duration, "delay": delay}
-            script.append(move)
-        
-    
-    # Add head movement so head is up while fish is talking
-    part = "head"
-    state = "turn"
-    duration = total_time
-    delay = 0
-    script.insert(0, {"part": part, "state": state, "duration": duration, "delay": delay})
+            script.append({
+                "part": "mouth",
+                "state": "close" if mouth_open else "open",
+                "duration": max(time_per_chunk * 0.35, 40),
+                "delay": delay,
+            })
+            delay += max(time_per_chunk * 0.35, 40)
 
-    for i in script:
-        print(i)
+    if total_time > 0:
+        script.insert(0, {"part": "head", "state": "turn", "duration": max(total_time + 250, 500), "delay": 0})
+
+    for move in script:
+        print(move)
+
+    return script
 
 
+async def animate_from_timings(timings_json_path=TIMINGS_JSON):
+    script = build_movement_script(timings_json_path)
+    if not script:
+        return []
 
-    #=================================| Set up the script list for export to ESP32 |========================
-    
-    asyncio.run(fish_performance_test(script))
+    await fish_performance_test(script)
+    return script
+
+
+def main():
+    asyncio.run(animate_from_timings())
 
 
 
