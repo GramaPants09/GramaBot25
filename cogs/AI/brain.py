@@ -47,16 +47,18 @@ class AgentBrain:
         client=None,
         *,
         memory: Memory | None = None,
-        model: str = DEFAULT_MODEL,
-        fast_model: str = FAST_MODEL,
+        model: str | None = None,
+        fast_model: str | None = None,
         max_iterations: int = 8,
         anthropic_client=None,
         api_key: str | None = None,
     ):
         self.client = client
         self.memory = memory or Memory()
-        self.model = model
-        self.fast_model = fast_model
+        # Model is env-configurable so cost/quality can be tuned without code
+        # changes — e.g. ANTHROPIC_MODEL=claude-haiku-4-5 for a near-free brain.
+        self.model = model or os.getenv("ANTHROPIC_MODEL") or DEFAULT_MODEL
+        self.fast_model = fast_model or os.getenv("ANTHROPIC_FAST_MODEL") or FAST_MODEL
         self.max_iterations = max_iterations
         self._anthropic = anthropic_client
         self._api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
