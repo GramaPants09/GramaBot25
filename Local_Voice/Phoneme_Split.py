@@ -14,7 +14,10 @@ with warnings.catch_warnings():
     # import pronouncing
 
 
-TIMINGS_JSON = r"/home/gramapants/Desktop/Discord_Bot/Local_Voice/tts/tts_output_timings/timings.json"
+# Relative to this file (Local_Voice/) so the bot runs anywhere.
+TIMINGS_JSON = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "tts", "tts_output_timings", "timings.json"
+)
 
 
 def _clean_word(word: str) -> str:

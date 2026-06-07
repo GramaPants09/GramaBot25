@@ -123,3 +123,11 @@ websockets==15.0.1
 yarl==1.22.0
 yt-dlp==2025.10.22
 zipp==3.23.0
+
+# --- GramaBot25 v2 upgrade (agentic brain, voice chat, Spotify, Butcher TTS) ---
+anthropic>=0.40.0           # the brain (Claude tool-use)
+spotipy>=2.24.0             # resolve Spotify links -> track names
+faster-whisper>=1.0.0       # local STT (voice chat)
+elevenlabs>=1.0.0           # Butcher TTS voice
+openai>=1.40.0              # OpenRouter fallback brain (keyless-Claude path)
+audioop-lts; python_version >= "3.13"   # audioop backport for SpeechRecognitionSink

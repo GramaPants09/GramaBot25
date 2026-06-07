@@ -185,9 +185,9 @@ async def reload(ctx, extension: str):
     """Reloads a cog without restarting the bot."""
     try:
         await client.reload_extension(f"cogs.{extension}")
-        await ctx.send(f"? Reloaded `{extension}` successfully.")
+        await ctx.send(f"✅ Reloaded `{extension}` successfully.")
     except Exception as e:
-        await ctx.send(f"? Failed to reload `{extension}`: `{e}`")
+        await ctx.send(f"❌ Failed to reload `{extension}`: `{e}`")
 
 
 def discover_cogs():
@@ -234,9 +234,9 @@ async def reload_all(ctx):
 
     msg = []
     if reloaded:
-        msg.append(f"? Reloaded/Loaded: {', '.join(reloaded)}")
+        msg.append(f"✅ Reloaded/Loaded: {', '.join(reloaded)}")
     if failed:
-        msg.append(f"? Failed: {', '.join(failed)}")
+        msg.append(f"❌ Failed: {', '.join(failed)}")
 
     await ctx.send("\n".join(msg) if msg else "No cogs found.")
 

@@ -6,10 +6,12 @@ import subprocess
 import edge_tts
 from pydub import AudioSegment
 
-MP3_AUDIO_FILE = r"/home/gramapants/Desktop/Discord_Bot/Local_Voice/tts/tts_input_audio/input.mp3"
-WAV_AUDIO_FILE = r"/home/gramapants/Desktop/Discord_Bot/Local_Voice/tts/tts_input_audio/input.wav"
-TRANSCRIPTION_FILE = r"/home/gramapants/Desktop/Discord_Bot/Local_Voice/tts/tts_input_transcription/transcription.txt"
-TIMING_OUTPUT_FILE = r"/home/gramapants/Desktop/Discord_Bot/Local_Voice/tts/tts_output_timings/timings.json"
+# Paths are relative to this file (Local_Voice/tts/) so the bot runs anywhere.
+_TTS_DIR = os.path.dirname(os.path.abspath(__file__))
+MP3_AUDIO_FILE = os.path.join(_TTS_DIR, "tts_input_audio", "input.mp3")
+WAV_AUDIO_FILE = os.path.join(_TTS_DIR, "tts_input_audio", "input.wav")
+TRANSCRIPTION_FILE = os.path.join(_TTS_DIR, "tts_input_transcription", "transcription.txt")
+TIMING_OUTPUT_FILE = os.path.join(_TTS_DIR, "tts_output_timings", "timings.json")
 
 def generate_txt_file(text):
     try:
