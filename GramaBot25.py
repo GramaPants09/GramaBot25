@@ -19,8 +19,34 @@ import threading
 import json
 import asyncio
 import discord
-# if not discord.opus.is_loaded():
-discord.opus.load_opus("libopus.so.0")
+
+
+def load_opus():
+    """Load libopus across platforms. discord.py auto-loads it on most systems;
+    this is a best-effort fallback that tries the common names per-OS and never
+    crashes the bot if opus is missing (voice just won't work)."""
+    if discord.opus.is_loaded():
+        return True
+    candidates = [
+        "libopus.so.0", "libopus.so",                 # Linux
+        "libopus.0.dylib", "libopus.dylib",           # macOS
+        "/opt/homebrew/lib/libopus.dylib",            # macOS (Apple Silicon brew)
+        "/usr/local/lib/libopus.dylib",               # macOS (Intel brew)
+        "opus",                                        # let ctypes search
+    ]
+    for name in candidates:
+        try:
+            discord.opus.load_opus(name)
+            if discord.opus.is_loaded():
+                return True
+        except Exception:
+            continue
+    print("[opus] libopus not loaded — voice features disabled. "
+          "Install it (mac: `brew install opus`, debian/pi: `apt install libopus0`).")
+    return False
+
+
+load_opus()
 from discord.ext import commands
 from Local_Voice.main import voice_loop_entrypoint
 
@@ -54,9 +80,9 @@ async def on_ready():
     await client.tree.sync()
     print(f"We have logged in as {client.user}")
  
-    print(discord.opus.is_loaded()) # Checks for discord voice
     if not discord.opus.is_loaded():
-        discord.opus.load_opus('libopus.so.0')
+        load_opus()
+    print(f"Opus loaded: {discord.opus.is_loaded()}")  # voice availability check
 
 
     # if not voice_started:
