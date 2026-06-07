@@ -237,14 +237,31 @@ class Music(commands.Cog):
             await ctx.send(OutputText.output(ctx.guild.id, "No song specified."))
             return
 
+        queries = [query]
+        try:
+            from cogs.Audio.spotify import is_spotify_url, expand_spotify
+
+            if is_spotify_url(query):
+                queries = expand_spotify(query)
+                if not queries:
+                    await ctx.send(OutputText.output(ctx.guild.id, "Couldn't read that Spotify link."))
+                    return
+                await ctx.send(OutputText.output(
+                    ctx.guild.id, f"Pulling {len(queries)} track(s) off Spotify..."))
+        except ImportError:
+            pass
+        except Exception as e:
+            await ctx.send(OutputText.output(ctx.guild.id, f"Spotify error: {e}"))
+            return
+
         guild_id = str(ctx.guild.id)
-        self.queue.setdefault(guild_id, []).append(query)
+        self.queue.setdefault(guild_id, []).extend(queries)
         self.save_queue()
 
         if not self.is_playing:
             await self.play_next(ctx)
         else:
-            await ctx.send(OutputText.output(ctx.guild.id,"Song added to queue!"))
+            await ctx.send(OutputText.output(ctx.guild.id, "Added to the queue!"))
 
     @commands.command()
     async def skip(self, ctx):
