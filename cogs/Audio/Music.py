@@ -553,6 +553,134 @@ class Music(commands.Cog):
         except Exception as e:
             print(f"[Fish Animation Error] {e}")
 
+    # ------------------------------------------------------------------
+    # Agent-facing helpers (driven by the AgentBrain tools, no ctx needed)
+    # ------------------------------------------------------------------
+    async def _agent_play_next(self, guild, text_channel):
+        gid = str(guild.id)
+        if self.loop_song and self.current_song:
+            song = self.current_song
+        elif self.queue.get(gid):
+            self.current_song = self.queue[gid][0] if self.loop_queue else self.queue[gid].pop(0)
+            self.save_queue()
+            song = self.current_song
+        else:
+            self.is_playing = False
+            vc = guild.voice_client
+            if vc:
+                await vc.disconnect()
+            return
+
+        self.is_playing = True
+        try:
+            stream_url, title, thumbnail = await self.get_stream_url(song)
+        except Exception:
+            if text_channel:
+                await text_channel.send(OutputText.output(guild.id, "Could not find the song."))
+            await self._agent_play_next(guild, text_channel)
+            return
+
+        vc = guild.voice_client
+        if vc is None:
+            self.is_playing = False
+            return
+
+        def after_playing(error):
+            fut = asyncio.run_coroutine_threadsafe(
+                self._agent_play_next(guild, text_channel), self.client.loop
+            )
+            try:
+                fut.result()
+            except Exception as e:
+                print(f"[agent] play_next error: {e}")
+
+        source = discord.FFmpegPCMAudio(stream_url, **FFMPEG_OPTIONS)
+        vc.play(discord.PCMVolumeTransformer(source, volume=self.volume), after=after_playing)
+        if text_channel:
+            embed = discord.Embed(title="Now Playing", description=title, color=discord.Color.green())
+            if thumbnail:
+                embed.set_thumbnail(url=thumbnail)
+            await text_channel.send(embed=embed)
+
+    async def agent_play(self, guild, member, text_channel, query):
+        if guild is None:
+            return "Music only works inside a server."
+        if not (member and getattr(member, "voice", None) and member.voice.channel):
+            return "You need to be in a voice channel first, mate."
+
+        vc = guild.voice_client
+        if vc and vc.is_connected():
+            if vc.channel != member.voice.channel:
+                await vc.move_to(member.voice.channel)
+        else:
+            await member.voice.channel.connect()
+
+        gid = str(guild.id)
+        queries = [query]
+        try:
+            from cogs.Audio.spotify import is_spotify_url, expand_spotify
+
+            if is_spotify_url(query):
+                queries = expand_spotify(query)
+                if not queries:
+                    return "Couldn't read anything off that Spotify link."
+        except ImportError:
+            pass
+
+        self.queue.setdefault(gid, []).extend(queries)
+        self.save_queue()
+
+        started = False
+        if not self.is_playing:
+            await self._agent_play_next(guild, text_channel)
+            started = True
+
+        if len(queries) > 1:
+            return f"Queued {len(queries)} tracks." + (" Starting now." if started else "")
+        return f"Playing {queries[0]}." if started else f"Queued: {queries[0]}."
+
+    async def agent_control(self, guild, action):
+        if guild is None:
+            return "That only works inside a server."
+        vc = guild.voice_client
+        if action == "skip":
+            if vc and vc.is_playing():
+                vc.stop()
+                return "Skipped."
+            return "Nothing's playing."
+        if action == "pause":
+            if vc and vc.is_playing():
+                vc.pause()
+                return "Paused."
+            return "Nothing to pause."
+        if action == "resume":
+            if vc and vc.is_paused():
+                vc.resume()
+                return "Resumed."
+            return "Nothing to resume."
+        if action == "stop":
+            gid = str(guild.id)
+            if vc and (vc.is_playing() or vc.is_paused()):
+                vc.stop()
+            self.queue[gid] = []
+            self.save_queue()
+            self.is_playing = False
+            self.current_song = None
+            if vc:
+                await vc.disconnect()
+            return "Stopped and cleared the queue."
+        return f"Unknown action '{action}'."
+
+    def agent_queue_text(self, guild):
+        if guild is None:
+            return "That only works inside a server."
+        q = self.queue.get(str(guild.id), [])
+        if not q:
+            return "Queue's empty."
+        lines = [f"{i + 1}. {s}" for i, s in enumerate(q[:10])]
+        extra = f"\n(+{len(q) - 10} more)" if len(q) > 10 else ""
+        return "Queue:\n" + "\n".join(lines) + extra
+
 async def handle_command(command: str, client: commands.Bot) -> Optional[str]:
     cog = client.get_cog("Music")
     if not cog:
