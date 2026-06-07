@@ -36,7 +36,7 @@ google-auth==2.42.0
 google-auth-httplib2==0.2.0
 google-generativeai==0.8.5
 googleapis-common-protos==1.71.0
-gpiozero==2.0.1
+gpiozero==2.0.1 ; platform_machine == "aarch64" or platform_machine == "armv7l" or platform_machine == "armv6l"
 greenlet==3.2.4
 grpcio==1.76.0
 grpcio-status==1.76.0
@@ -55,7 +55,7 @@ joblib==1.5.2
 kiwisolver==1.4.9
 kneed==0.8.5
 lazy_loader==0.4
-lgpio==0.2.2.0
+lgpio==0.2.2.0 ; platform_machine == "aarch64" or platform_machine == "armv7l" or platform_machine == "armv6l"
 librosa==0.11.0
 llvmlite==0.45.1
 lxml==6.0.2
@@ -96,7 +96,7 @@ requests==2.32.5
 rfc3986==2.0.0
 rich==14.2.0
 rich-click==1.9.4
-RPi.GPIO==0.7.1
+RPi.GPIO==0.7.1 ; platform_machine == "aarch64" or platform_machine == "armv7l" or platform_machine == "armv6l"
 rsa==4.9.1
 scikit-learn==1.7.2
 scipy==1.16.3
