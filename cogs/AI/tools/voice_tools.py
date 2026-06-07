@@ -29,7 +29,7 @@ async def join_voice(ctx):
         return "Voice isn't available right now."
     if ctx.guild is None:
         return "Voice only works inside a server."
-    return await cog.agent_join(ctx.guild, _member(ctx))
+    return await cog.agent_join(ctx.guild, _member(ctx), ctx.channel)
 
 
 @tool("leave_voice", "Leave the current voice channel.",

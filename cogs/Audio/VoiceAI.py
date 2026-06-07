@@ -1,420 +1,325 @@
+"""VoiceAI — GramaBot joins voice calls and chats with whoever's in them.
+
+Pipeline: discord-ext-voice-recv captures per-user audio -> STT adapter
+(faster-whisper) -> AgentBrain (full tool access) -> ElevenLabs Butcher TTS ->
+played back in the channel. A wake-word ("gramabot"/"butcher") opens a ~120s
+conversation window so the bot doesn't talk over the whole call; ``$listen_on``
+makes it always-on.
+
+Primary STT path is the library's SpeechRecognitionSink (per-user phrase VAD);
+if that's unavailable on the installed alpha wheel it falls back to a BasicSink
+buffer + periodic flush. The bot mutes its own receiver while speaking so it
+never transcribes itself into a loop.
+"""
+import asyncio
+import os
+import tempfile
+import wave
+
 import discord
 from discord.ext import commands
-import os
-import asyncio
-import edge_tts
-import nacl  # Ensure pynacl is installed
-import speech_recognition as sr
-import tempfile
-import time
-import wave
+
 import OutputText
+from cogs.Audio import stt as stt_adapter
+from cogs.Audio import tts as tts_adapter
 
 try:
     from discord.ext import voice_recv
-except Exception as e:
-    print(f"[VoiceAI] Failed to import voice_recv: {type(e).__name__}: {e}")
+except Exception as e:  # pragma: no cover
+    print(f"[VoiceAI] voice_recv unavailable: {type(e).__name__}: {e}")
     voice_recv = None
 
-class VoiceAI(commands.Cog):
-    """Cog for joining voice channels and speaking with TTS."""
+WAKE_WORDS = ("gramabot", "grama bot", "butcher", "jarvis", "hey grama", "oi grama")
+CONVO_WINDOW = 120.0
 
+
+class VoiceAI(commands.Cog):
     def __init__(self, client):
         self.client = client
-        self.listen_tasks = {}
         self.speaking_guilds = set()
-        self.processing_locks = {}
-        self.voice_buffers = {}
-        self.voice_targets = {}
+        self.windows = {}           # guild_id -> last activity time (loop clock)
+        self.bound_text = {}        # guild_id -> text channel for replies/approvals
+        self.locks = {}             # guild_id -> asyncio.Lock
+        self.always_on = set()      # guild_ids answering without a wake word
+        self.buffers = {}           # guild_id -> {user_id: bytearray}  (fallback)
+        self._fallback_active = {}  # guild_id -> bool
 
     @commands.Cog.listener()
     async def on_ready(self):
         print("VoiceAI Cog is online!")
 
-    def _supports_voice_receive(self) -> bool:
-        return voice_recv is not None
+    # ----------------------------------------------------------------- plumbing
+    def _brain(self):
+        ai = self.client.get_cog("AI")
+        return getattr(ai, "brain", None)
 
-    def _get_lock(self, guild_id: int) -> asyncio.Lock:
-        if guild_id not in self.processing_locks:
-            self.processing_locks[guild_id] = asyncio.Lock()
-        return self.processing_locks[guild_id]
+    def _lock(self, guild_id: int) -> asyncio.Lock:
+        return self.locks.setdefault(guild_id, asyncio.Lock())
 
-    async def _speak_in_voice(self, voice_client: discord.VoiceClient, text: str, guild_id: int):
-        clean_text = (text or "").strip()
-        if not clean_text:
-            return
-
-        output_file = f"audio/voice_{guild_id}_{int(time.time() * 1000)}.mp3"
-        self.speaking_guilds.add(guild_id)
-        try:
-            tts = edge_tts.Communicate(clean_text, "en-GB-RyanNeural")
-            await tts.save(output_file)
-
-            if not os.path.exists(output_file):
-                return
-
-            done_event = asyncio.Event()
-
-            def after_playback(error):
-                if error:
-                    print(f"Playback error: {error}")
-                if os.path.exists(output_file):
-                    os.remove(output_file)
-                self.client.loop.call_soon_threadsafe(done_event.set)
-
-            while voice_client.is_playing():
-                await asyncio.sleep(0.1)
-
-            source = discord.FFmpegPCMAudio(output_file)
-            voice_client.play(source, after=after_playback)
-            await done_event.wait()
-        finally:
-            self.speaking_guilds.discard(guild_id)
-
-    async def _transcribe_pcm(self, pcm_bytes: bytes) -> str:
-        print(f"[VoiceAI] Transcribing {len(pcm_bytes)} PCM bytes...")
-        if not pcm_bytes or len(pcm_bytes) < 8000:
-            print(f"[VoiceAI] PCM too short ({len(pcm_bytes)} bytes), skipping transcription.")
-            return ""
-
-        recognizer = sr.Recognizer()
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            temp_path = tmp.name
-
-        try:
-            with wave.open(temp_path, "wb") as wav_file:
-                wav_file.setnchannels(2)
-                wav_file.setsampwidth(2)
-                wav_file.setframerate(48000)
-                wav_file.writeframes(pcm_bytes)
-            print(f"[VoiceAI] WAV written to {temp_path}")
-
-            with sr.AudioFile(temp_path) as source:
-                audio = recognizer.record(source)
-            result = recognizer.recognize_google(audio).strip()
-            print(f"[VoiceAI] Transcription result: '{result}'")
-            return result
-        except sr.UnknownValueError:
-            print(f"[VoiceAI] Transcription failed: Could not understand audio")
-            return ""
-        except Exception as e:
-            print(f"[VoiceAI] Transcription error: {e}")
-            return ""
-        finally:
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
-
-    async def _process_text(self, guild_id: int, target_user_id: int, spoken_text: str):
-        print(f"[VoiceAI] Processing text: '{spoken_text}'")
-        lock = self._get_lock(guild_id)
-        if lock.locked():
-            print(f"[VoiceAI] Lock already held, skipping processing.")
-            return
-
-        async with lock:
-            if not spoken_text:
-                print(f"[VoiceAI] Empty text after transcription, skipping.")
-                return
-
-            ai_cog = self.client.get_cog("AI")
-            if ai_cog is None:
-                print("[VoiceAI] AI cog not loaded; cannot generate voice response.")
-                return
-
-            print(f"[VoiceAI] Calling AI.generate() with text: '{spoken_text}'")
-            try:
-                ai_response = await ai_cog.generate(target_user_id, spoken_text)
-                print(f"[VoiceAI] AI response: '{ai_response}'")
-            except Exception as e:
-                print(f"[VoiceAI] AI generation error: {e}")
-                return
-
-            guild = self.client.get_guild(guild_id)
-            if guild is None or guild.voice_client is None:
-                print(f"[VoiceAI] Guild or voice_client is None, cannot speak response.")
-                return
-
-            print(f"[VoiceAI] Speaking AI response...")
-            await self._speak_in_voice(guild.voice_client, ai_response, guild_id)
-
-    async def _listen_loop(self, guild_id: int, target_user_id: int):
-        print(f"[VoiceAI] Listen loop started for guild {guild_id}, user {target_user_id}")
-        await asyncio.sleep(0.4)
-        loop_iteration = 0
-        while True:
-            loop_iteration += 1
-            print(f"[VoiceAI] Listen loop iteration {loop_iteration}...")
-            guild = self.client.get_guild(guild_id)
-            if guild is None or guild.voice_client is None:
-                print(f"[VoiceAI] Guild or voice_client is None, stopping listen loop.")
-                return
-
-            voice_client = guild.voice_client
-            if guild_id in self.speaking_guilds:
-                print(f"[VoiceAI] Currently speaking, waiting...")
-                await asyncio.sleep(0.4)
-                continue
-
-            if voice_recv is None or not isinstance(voice_client, voice_recv.VoiceRecvClient):
-                print("[VoiceAI] Voice receive is unavailable in this Discord library build.")
-                return
-
-            try:
-                pcm_bytes = bytes(self.voice_buffers.get(guild_id, b""))
-                buffer_len = len(self.voice_buffers.get(guild_id, b""))
-                self.voice_buffers[guild_id] = bytearray()
-                print(f"[VoiceAI] Buffer collected: {buffer_len} bytes")
-            except Exception as e:
-                print(f"[VoiceAI] Voice buffer read error: {e}")
-                await asyncio.sleep(1.0)
-                continue
-
-            if pcm_bytes:
-                print(f"[VoiceAI] Transcribing {len(pcm_bytes)} bytes from buffer...")
-                spoken_text = await self._transcribe_pcm(pcm_bytes)
-                if spoken_text:
-                    await self._process_text(guild_id, target_user_id, spoken_text)
-                else:
-                    print(f"[VoiceAI] Transcription returned empty, skipping.")
-            else:
-                print(f"[VoiceAI] No audio in buffer, waiting for next cycle...")
-
-            await asyncio.sleep(6.0)
-
-    async def _ensure_receive_client(self, ctx):
+    async def _ensure_recv_client(self, channel):
+        """Connect to (or move into) ``channel`` as a VoiceRecvClient."""
         if voice_recv is None:
-            print(f"[VoiceAI] voice_recv module is None, cannot connect")
-            return False
-
-        channel = ctx.author.voice.channel
-        vc = ctx.voice_client
-        print(f"[VoiceAI] _ensure_receive_client: current vc type = {type(vc).__name__ if vc else 'None'}")
-
+            return None
+        guild = channel.guild
+        vc = guild.voice_client
         if vc and isinstance(vc, voice_recv.VoiceRecvClient):
-            print(f"[VoiceAI] Already connected with VoiceRecvClient, moving to channel")
-            await vc.move_to(channel)
-            return True
+            if vc.channel != channel:
+                await vc.move_to(channel)
+            return vc
+        if vc:  # wrong client type (e.g. plain music client) — reconnect
+            await vc.disconnect(force=True)
+        return await channel.connect(cls=voice_recv.VoiceRecvClient)
 
-        if vc and not isinstance(vc, voice_recv.VoiceRecvClient):
-            print(f"[VoiceAI] Wrong VC type ({type(vc).__name__}), disconnecting and reconnecting as VoiceRecvClient")
-            await vc.disconnect()
+    # --------------------------------------------------------------- listening
+    def _make_sink(self):
+        try:
+            from discord.ext.voice_recv.extras import speechrecognition as srx
 
-        print(f"[VoiceAI] Connecting to channel as VoiceRecvClient...")
-        connected_vc = await channel.connect(cls=voice_recv.VoiceRecvClient)
-        print(f"[VoiceAI] Connected: type = {type(connected_vc).__name__}")
-        return True
+            return srx.SpeechRecognitionSink(
+                process_cb=stt_adapter.make_process_cb(),
+                text_cb=self._on_text,
+            ), "sr"
+        except Exception as e:
+            print(f"[VoiceAI] SpeechRecognitionSink unavailable ({e}); using BasicSink fallback.")
+            return voice_recv.BasicSink(self._basic_on_audio), "basic"
 
-    def _start_voice_recv(self, ctx, target_user_id: int):
-        guild_id = ctx.guild.id
-        vc = ctx.voice_client
-        print(f"[VoiceAI] _start_voice_recv: vc type = {type(vc).__name__}, vc module = {type(vc).__module__}")
-        print(f"[VoiceAI] voice_recv module loaded: {voice_recv is not None}")
-        print(f"[VoiceAI] isinstance check: {isinstance(vc, voice_recv.VoiceRecvClient) if voice_recv else 'N/A'}")
-        
-        if voice_recv is None or vc is None or not isinstance(vc, voice_recv.VoiceRecvClient):
-            print(f"[VoiceAI] Not a VoiceRecvClient, returning False")
+    async def _start_listening(self, guild, text_channel) -> bool:
+        vc = guild.voice_client
+        if vc is None or voice_recv is None or not isinstance(vc, voice_recv.VoiceRecvClient):
             return False
-
-        self.voice_targets[guild_id] = target_user_id
-        self.voice_buffers[guild_id] = bytearray()
-
-        def on_audio(user, data):
-            try:
-                user_id = getattr(user, "id", None) if user else None
-                target_id = self.voice_targets.get(guild_id)
-                print(f"[VoiceAI] on_audio callback: user={user_id}, target={target_id}, data_type={type(data).__name__}")
-                
-                if guild_id in self.speaking_guilds:
-                    print(f"[VoiceAI] Currently speaking, ignoring audio from user {user_id}")
-                    return
-                if user is None:
-                    print(f"[VoiceAI] User is None, skipping")
-                    return
-                if user_id != target_id:
-                    print(f"[VoiceAI] Audio from {user_id}, but target is {target_id}, skipping")
-                    return
-                    
-                pcm = getattr(data, "pcm", None)
-                if not pcm:
-                    print(f"[VoiceAI] No PCM data in audio frame")
-                    return
-                    
-                print(f"[VoiceAI] Buffering {len(pcm)} bytes of audio from user {user_id}")
-                self.voice_buffers[guild_id].extend(pcm)
-            except Exception as e:
-                print(f"[VoiceAI] Voice receive callback error: {e}")
-
+        self.bound_text[guild.id] = text_channel
         try:
             if hasattr(vc, "is_listening") and vc.is_listening():
-                print(f"[VoiceAI] Stopping existing listener...")
                 vc.stop_listening()
-            print(f"[VoiceAI] Creating BasicSink and calling vc.listen()...")
-            sink = voice_recv.BasicSink(on_audio)
-            print(f"[VoiceAI] Sink created: {type(sink).__name__}")
+        except Exception:
+            pass
+
+        sink, kind = self._make_sink()
+        try:
             vc.listen(sink)
-            print(f"[VoiceAI] vc.listen() returned, is_listening() = {vc.is_listening() if hasattr(vc, 'is_listening') else 'N/A'}")
-            print(f"[VoiceAI] Listening started successfully")
-            return True
         except Exception as e:
-            print(f"[VoiceAI] Voice receive start error: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"[VoiceAI] vc.listen failed: {e}")
             return False
 
-    async def _start_listening(self, ctx, target_user_id: int):
-        guild_id = ctx.guild.id
-        old_task = self.listen_tasks.get(guild_id)
-        if old_task and not old_task.done():
-            old_task.cancel()
-
-        self.voice_targets[guild_id] = target_user_id
-        if not self._start_voice_recv(ctx, target_user_id):
-            return False
-
-        self.listen_tasks[guild_id] = asyncio.create_task(self._listen_loop(guild_id, target_user_id))
+        if kind == "basic":
+            self._fallback_active[guild.id] = True
+            self.buffers[guild.id] = {}
+            asyncio.create_task(self._flush_loop(guild))
         return True
 
-    def _stop_listening(self, guild_id: int):
-        task = self.listen_tasks.get(guild_id)
-        if task and not task.done():
-            task.cancel()
-        if guild_id in self.listen_tasks:
-            del self.listen_tasks[guild_id]
-        if guild_id in self.voice_targets:
-            del self.voice_targets[guild_id]
-        if guild_id in self.voice_buffers:
-            del self.voice_buffers[guild_id]
-
-        guild = self.client.get_guild(guild_id)
-        if guild and guild.voice_client and hasattr(guild.voice_client, "stop_listening"):
+    def _stop_listening(self, guild):
+        gid = guild.id
+        self._fallback_active[gid] = False
+        self.windows.pop(gid, None)
+        self.buffers.pop(gid, None)
+        vc = guild.voice_client
+        if vc and hasattr(vc, "stop_listening"):
             try:
-                guild.voice_client.stop_listening()
+                vc.stop_listening()
             except Exception:
                 pass
 
+    # -- SpeechRecognitionSink path: text_cb gives us finalised per-user text --
+    def _on_text(self, user, text):
+        # Runs on the receive thread — hop back onto the loop.
+        if not text or user is None or getattr(user, "bot", False):
+            return
+        guild = getattr(user, "guild", None)
+        if guild is None or guild.id in self.speaking_guilds:
+            return
+        asyncio.run_coroutine_threadsafe(self._handle(guild, user, text), self.client.loop)
+
+    # -- BasicSink fallback path: buffer PCM per user, flush periodically --
+    def _basic_on_audio(self, user, data):
+        try:
+            if user is None or getattr(user, "bot", False):
+                return
+            guild = getattr(user, "guild", None)
+            if guild is None or guild.id in self.speaking_guilds:
+                return
+            pcm = getattr(data, "pcm", None)
+            if not pcm:
+                return
+            self.buffers.setdefault(guild.id, {}).setdefault(user.id, bytearray()).extend(pcm)
+        except Exception as e:
+            print(f"[VoiceAI] basic audio error: {e}")
+
+    async def _flush_loop(self, guild):
+        gid = guild.id
+        while self._fallback_active.get(gid) and guild.voice_client is not None:
+            await asyncio.sleep(4.0)
+            if gid in self.speaking_guilds:
+                continue
+            users = self.buffers.get(gid, {})
+            for uid, buf in list(users.items()):
+                if len(buf) < 48000:  # ~0.25s of 48k stereo 16-bit; too short to bother
+                    continue
+                pcm = bytes(buf)
+                users[uid] = bytearray()
+                member = guild.get_member(uid)
+                if member is None:
+                    continue
+                text = await asyncio.to_thread(self._pcm_to_text, pcm)
+                if text:
+                    await self._handle(guild, member, text)
+
+    def _pcm_to_text(self, pcm: bytes) -> str:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            path = f.name
+        try:
+            with wave.open(path, "wb") as w:
+                w.setnchannels(2)
+                w.setsampwidth(2)
+                w.setframerate(48000)
+                w.writeframes(pcm)
+            return stt_adapter.transcribe_wav(path)
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+    # ----------------------------------------------------------- conversation
+    async def _handle(self, guild, member, text):
+        gid = guild.id
+        now = asyncio.get_event_loop().time()
+        lowered = text.lower()
+        is_wake = any(w in lowered for w in WAKE_WORDS)
+        active = gid in self.always_on or (now - self.windows.get(gid, 0) < CONVO_WINDOW)
+        if not (is_wake or active):
+            return
+
+        lock = self._lock(gid)
+        if lock.locked():
+            return  # already mid-response; drop overlapping speech
+        async with lock:
+            self.windows[gid] = now
+            brain = self._brain()
+            if brain is None:
+                return
+            channel = self.bound_text.get(gid)
+            prompt = f'[Voice call. {member.display_name} just said this out loud.] {text}'
+            try:
+                response = await brain.respond(
+                    user=member, channel=channel, guild=guild, text=prompt, voice=True
+                )
+            except Exception as e:
+                print(f"[VoiceAI] brain error: {e}")
+                return
+            await self._speak(guild, response)
+
+    async def _speak(self, guild, text):
+        clean = (text or "").strip()
+        vc = guild.voice_client
+        if not clean or vc is None:
+            return
+        path = await tts_adapter.synthesize(clean)
+        if not path or not os.path.exists(path):
+            return
+
+        gid = guild.id
+        done = asyncio.Event()
+
+        def after(err):
+            if err:
+                print(f"[VoiceAI] playback error: {err}")
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            self.client.loop.call_soon_threadsafe(done.set)
+
+        self.speaking_guilds.add(gid)
+        try:
+            while vc.is_playing():
+                await asyncio.sleep(0.1)
+            vc.play(discord.FFmpegPCMAudio(path), after=after)
+            await done.wait()
+            await asyncio.sleep(0.3)  # let the tail clear before we listen again
+        finally:
+            self.speaking_guilds.discard(gid)
+
+    # ------------------------------------------------------- agent-facing API
+    async def agent_join(self, guild, member, text_channel=None):
+        if not (member and getattr(member, "voice", None) and member.voice.channel):
+            return "They need to be in a voice channel first."
+        try:
+            await self._ensure_recv_client(member.voice.channel)
+        except Exception as e:
+            return f"Couldn't join voice: {e}"
+        await self._start_listening(guild, text_channel or self.bound_text.get(guild.id))
+        self.always_on.add(guild.id)
+        return f"Joined {member.voice.channel.name} and I'm all ears."
+
+    async def agent_leave(self, guild):
+        if guild is None or guild.voice_client is None:
+            return "I'm not in a voice channel."
+        self.always_on.discard(guild.id)
+        self._stop_listening(guild)
+        await guild.voice_client.disconnect()
+        return "Left the voice channel."
+
+    async def agent_speak(self, guild, text):
+        if guild is None or guild.voice_client is None:
+            return "I'm not in a voice channel to speak in."
+        await self._speak(guild, text)
+        return f"Said: {text}"
+
+    # =============================================================== COMMANDS
     @commands.command()
     async def join(self, ctx):
-        """Joins the user's voice channel."""
+        """Join your voice channel and start listening."""
         if not ctx.author.voice or not ctx.author.voice.channel:
-            await ctx.send(OutputText.output(ctx.guild.id,"You're not in a voice channel."))
+            await ctx.send(OutputText.output(ctx.guild.id, "You're not in a voice channel."))
             return
-
-        channel = ctx.author.voice.channel
-        
-        if ctx.voice_client:
-            try:
-                ok = await self._ensure_receive_client(ctx)
-                if ok:
-                    await ctx.send(OutputText.output(ctx.guild.id,"Moved to your channel."))
-            except Exception as e:
-                await ctx.send(OutputText.output(ctx.guild.id,f"Error connecting: {e}"))
-                return
-        else:
-            try:
-                await self._ensure_receive_client(ctx)
-                await ctx.send(OutputText.output(ctx.guild.id,f"Connected to {channel}!"))
-            except Exception as e:
-                await ctx.send(OutputText.output(ctx.guild.id,f"Error connecting: {e}"))
-                return
-
-        if not self._supports_voice_receive() or voice_recv is None:
-            await ctx.send(OutputText.output(ctx.guild.id, "Voice listening requires discord-ext-voice-recv (discord.py)."))
+        if voice_recv is None:
+            await ctx.send(OutputText.output(ctx.guild.id,
+                          "Voice listening needs discord-ext-voice-recv installed."))
             return
-
-        started = await self._start_listening(ctx, ctx.author.id)
+        try:
+            await self._ensure_recv_client(ctx.author.voice.channel)
+        except Exception as e:
+            await ctx.send(OutputText.output(ctx.guild.id, f"Error connecting: {e}"))
+            return
+        started = await self._start_listening(ctx.guild, ctx.channel)
         if not started:
-            await ctx.send(OutputText.output(ctx.guild.id, "Couldn't start voice listening. Check voice receive setup."))
+            await ctx.send(OutputText.output(ctx.guild.id, "Couldn't start voice listening."))
             return
-        await ctx.send(OutputText.output(ctx.guild.id, f"Now listening to {ctx.author.display_name} in voice."))
+        self.windows[ctx.guild.id] = asyncio.get_event_loop().time()
+        await ctx.send(OutputText.output(ctx.guild.id,
+                      f"In the call. Say 'gramabot' or 'butcher' to get my attention."))
 
     @commands.command(name="leave")
     async def leave(self, ctx):
-        """Leaves the voice channel."""
-        guild_id = ctx.guild.id
-        self._stop_listening(guild_id)
-
-        if ctx.voice_client:
-            await ctx.voice_client.disconnect()
-            await ctx.send(OutputText.output(ctx.guild.id,"Disconnected from the voice channel."))
-        else:
-            await ctx.send(OutputText.output(ctx.guild.id,"I'm not in a voice channel."))
+        """Leave the voice channel."""
+        msg = await self.agent_leave(ctx.guild)
+        await ctx.send(OutputText.output(ctx.guild.id, msg))
 
     @commands.command(name="speak")
     async def speak(self, ctx, *, text):
-        """Speaks the given text using TTS."""
+        """Say something out loud."""
         if ctx.voice_client is None:
             await ctx.send("Join a voice channel first!")
             return
-
-        voice = "en-GB-RyanNeural"
-        #voice = "hi-IN-MadhurNeural"
-        #voice = "en-US-RogerNeural"
-        output_file = "audio/voice.mp3"
-
-        try:
-            # Generate TTS audio
-            tts = edge_tts.Communicate(text, voice)
-            await tts.save(output_file)
-            
-            # Ensure file was created
-            if not os.path.exists(output_file):
-                await ctx.send(OutputText.output(ctx.guild.id,"TTS failed: No audio file created."))
-                return
-            
-            def after_playback(error):
-                if error:
-                    print(f"Playback error: {error}")
-                if os.path.exists(output_file):
-                    os.remove(output_file)
-            
-            # Play audio
-            if not ctx.voice_client.is_playing():
-                source = discord.FFmpegPCMAudio(output_file)
-                ctx.voice_client.play(source, after=after_playback)
-                await ctx.send(OutputText.output(ctx.guild.id,f"Saying: {text}"))
-            else:
-                await ctx.send(OutputText.output(ctx.guild.id,"Already speaking!"))
-            
-            # Wait for playback
-            while ctx.voice_client.is_playing():
-                await asyncio.sleep(1)
-            
-        except Exception as e:
-            await ctx.send(OutputText.output(ctx.guild.id,f"Error: {e}"))
+        await self._speak(ctx.guild, text)
+        await ctx.send(OutputText.output(ctx.guild.id, f"Saying: {text}"))
 
     @commands.command(name="listen_on")
     async def listen_on(self, ctx):
-        """Enable AI voice listening in the current VC without rejoining."""
+        """Answer everything in the call (no wake word needed)."""
         if ctx.voice_client is None:
             await ctx.send(OutputText.output(ctx.guild.id, "Join a voice channel first!"))
             return
-
-        if not self._supports_voice_receive() or voice_recv is None:
-            await ctx.send(OutputText.output(ctx.guild.id, "Voice listening requires discord-ext-voice-recv (discord.py)."))
-            return
-
-        try:
-            await self._ensure_receive_client(ctx)
-        except Exception as e:
-            await ctx.send(OutputText.output(ctx.guild.id, f"Couldn't enable listening: {e}"))
-            return
-
-        started = await self._start_listening(ctx, ctx.author.id)
-        if not started:
-            await ctx.send(OutputText.output(ctx.guild.id, "Couldn't start voice listening. Check voice receive setup."))
-            return
-        await ctx.send(OutputText.output(ctx.guild.id, f"Voice listening enabled for {ctx.author.display_name}."))
+        self.always_on.add(ctx.guild.id)
+        self.bound_text[ctx.guild.id] = ctx.channel
+        await ctx.send(OutputText.output(ctx.guild.id, "Always-on: I'll chime in on everything now."))
 
     @commands.command(name="listen_off")
     async def listen_off(self, ctx):
-        """Disable AI voice listening in the current guild."""
-        guild_id = ctx.guild.id
-        had_task = guild_id in self.listen_tasks
-        self._stop_listening(guild_id)
-        if had_task:
-            await ctx.send(OutputText.output(ctx.guild.id, "Voice listening disabled."))
-        else:
-            await ctx.send(OutputText.output(ctx.guild.id, "Voice listening is already off."))
+        """Go back to wake-word only."""
+        self.always_on.discard(ctx.guild.id)
+        await ctx.send(OutputText.output(ctx.guild.id, "Back to wake-word only."))
+
 
 async def setup(client):
     await client.add_cog(VoiceAI(client))
