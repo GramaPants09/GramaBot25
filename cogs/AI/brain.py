@@ -82,11 +82,12 @@ class AgentBrain:
         text: str,
         voice: bool = False,
         chat: bool = False,
+        mem_key: str | None = None,
         request_approval=None,
     ) -> str:
         speaker_id = str(getattr(user, "id", user) or "local_user")
         channel_id = str(getattr(channel, "id", channel) or "dm")
-        mem_user = "chat" if chat else speaker_id
+        mem_user = mem_key or ("chat" if chat else speaker_id)
 
         system = persona.system_prompt_for(speaker_id, in_chat=chat or voice)
         messages = list(self.memory.history(mem_user, channel_id, limit=20))
@@ -110,10 +111,12 @@ class AgentBrain:
 
     # --------------------------------------------------------------- tool loop
     async def _run_loop(self, client, system, messages, ctx: ToolContext) -> str:
-        tools = registry.anthropic_schemas()
+        # Only advertise gated tools when an approval gate is actually wired,
+        # so the model never wastes iterations on tools that will be refused.
+        tools = registry.anthropic_schemas(include_gated=ctx.request_approval is not None)
         last_text = ""
         for _ in range(self.max_iterations):
-            kwargs = dict(model=self.model, system=system, messages=messages, max_tokens=1024)
+            kwargs = dict(model=self.model, system=system, messages=messages, max_tokens=2048)
             if tools:
                 kwargs["tools"] = tools
             resp = await client.messages.create(**kwargs)
@@ -125,6 +128,11 @@ class AgentBrain:
             tool_uses = [b for b in blocks if getattr(b, "type", None) == "tool_use"]
             if text_out:
                 last_text = text_out
+
+            # A truncated response may hold an incomplete tool_use block — never
+            # dispatch that; just return whatever text we managed to get.
+            if getattr(resp, "stop_reason", None) == "max_tokens":
+                return self._clean(last_text) or "Ran out of room there — ask again and I'll keep it shorter."
 
             if not tool_uses:
                 return self._clean(last_text)

@@ -92,6 +92,45 @@ async def test_gated_tool_denied_without_approval(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_max_tokens_stop_does_not_dispatch_tool(tmp_path):
+    ran = {"called": False}
+
+    @registry.tool("dispatch_test", "d", {"type": "object", "properties": {}})
+    async def _d(ctx):
+        ran["called"] = True
+        return "x"
+
+    # A truncated turn carrying a (possibly incomplete) tool_use must NOT run it.
+    script = [
+        FakeResp(
+            [Block(type="text", text="partial answer"),
+             Block(type="tool_use", id="t1", name="dispatch_test", input={})],
+            "max_tokens",
+        )
+    ]
+    fake = FakeAnthropic(script)
+    brain = AgentBrain(memory=Memory(db_path=str(tmp_path / "b.db")), anthropic_client=fake, api_key="x")
+    out = await brain.respond(user="u", channel="c", guild=None, text="go")
+    assert ran["called"] is False
+    assert "partial" in out
+
+
+@pytest.mark.asyncio
+async def test_gated_tools_hidden_when_no_approval(tmp_path):
+    @registry.tool("gated_hidden_test", "g", {"type": "object", "properties": {}}, gated=True)
+    async def _g(ctx):
+        return "x"
+
+    script = [FakeResp([Block(type="text", text="hi")], "end_turn")]
+    fake = FakeAnthropic(script)
+    brain = AgentBrain(memory=Memory(db_path=str(tmp_path / "b.db")), anthropic_client=fake, api_key="x")
+    await brain.respond(user="u", channel="c", guild=None, text="go")  # no request_approval
+    tools = fake.messages.calls[0].get("tools", [])
+    names = {t["name"] for t in tools}
+    assert "gated_hidden_test" not in names
+
+
+@pytest.mark.asyncio
 async def test_no_key_uses_fallback_message(tmp_path, monkeypatch):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("OPEN_ROUTER_API_KEY", raising=False)

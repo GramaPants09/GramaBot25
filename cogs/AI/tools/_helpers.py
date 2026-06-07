@@ -1,6 +1,12 @@
 """Shared helpers for tool handlers."""
 from __future__ import annotations
 
+import re
+
+# A bare snowflake (15-20 digits) or a <@id> / <@!id> mention — NOT stray digits
+# embedded in a display name like "Player2".
+_ID_RE = re.compile(r"<@!?(\d+)>|(\d{15,20})")
+
 
 def resolve_member(guild, who):
     """Best-effort resolve ``who`` (id / <@mention> / display name) to a Member.
@@ -13,12 +19,11 @@ def resolve_member(guild, who):
     if not text:
         return None
 
-    # raw id or <@id> / <@!id>
-    digits = "".join(ch for ch in text if ch.isdigit())
-    if digits:
-        m = guild.get_member(int(digits))
-        if m:
-            return m
+    m_id = _ID_RE.fullmatch(text)
+    if m_id:
+        member = guild.get_member(int(m_id.group(1) or m_id.group(2)))
+        if member:
+            return member
 
     lowered = text.lstrip("@").lower()
     for m in getattr(guild, "members", []):

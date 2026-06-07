@@ -57,3 +57,21 @@ def test_anthropic_schemas_shape():
 def test_get_tool_missing_returns_none():
     registry = _fresh_registry()
     assert registry.get_tool("does-not-exist") is None
+
+
+def test_include_gated_filter():
+    registry = _fresh_registry()
+
+    @registry.tool("safe", "s", {"type": "object", "properties": {}})
+    async def _s(ctx):
+        return "ok"
+
+    @registry.tool("danger", "d", {"type": "object", "properties": {}}, gated=True)
+    async def _d(ctx):
+        return "boom"
+
+    all_names = {s["name"] for s in registry.anthropic_schemas()}
+    ungated = {s["name"] for s in registry.anthropic_schemas(include_gated=False)}
+    assert {"safe", "danger"} <= all_names
+    assert "safe" in ungated
+    assert "danger" not in ungated

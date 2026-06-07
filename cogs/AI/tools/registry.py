@@ -55,9 +55,15 @@ def all_tools() -> list[Tool]:
     return list(_REGISTRY.values())
 
 
-def anthropic_schemas() -> list[dict]:
-    """Return tool definitions in Anthropic's ``tools=[...]`` format."""
+def anthropic_schemas(include_gated: bool = True) -> list[dict]:
+    """Return tool definitions in Anthropic's ``tools=[...]`` format.
+
+    When ``include_gated`` is False, gated (approval-required) tools are omitted
+    so the model isn't offered tools that will always be refused on a surface
+    with no approval gate wired (e.g. voice).
+    """
     return [
         {"name": t.name, "description": t.description, "input_schema": t.schema}
         for t in _REGISTRY.values()
+        if include_gated or not t.gated
     ]

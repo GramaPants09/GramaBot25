@@ -5,6 +5,7 @@ everything in that channel, then goes quiet again. All thinking is delegated to
 the shared AgentBrain owned by the AI cog.
 """
 import asyncio
+import re
 
 import discord
 from discord.ext import commands
@@ -35,14 +36,16 @@ class RespondInChat(commands.Cog):
         if message.content.startswith("$"):
             return
 
-        if "fuck off" in message.content.lower():
-            self.listening_channels.pop(message.channel.id, None)
-            await message.channel.send("Fine. Be that way.")
-            return
-
         is_wake = self.client.user in message.mentions
         active = message.channel.id in self.listening_channels
         now = asyncio.get_event_loop().time()
+
+        # Only honour "fuck off" if we're actually mid-conversation here, so we
+        # don't barge into unrelated messages that merely contain the phrase.
+        if active and re.search(r"\bfuck off\b", message.content.lower()):
+            self.listening_channels.pop(message.channel.id, None)
+            await message.channel.send("Fine. Be that way.")
+            return
 
         if active and not is_wake:
             started = self.listening_channels[message.channel.id]

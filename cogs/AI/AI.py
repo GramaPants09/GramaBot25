@@ -45,6 +45,7 @@ class AI(commands.Cog):
 
         self.memory = Memory(db_path=BRAIN_DB)
         self.brain = AgentBrain(client, memory=self.memory)
+        self._bot_exchanges = {}  # (channel_id, author_id) -> (count, window_start)
 
     @commands.Cog.listener()
     async def on_ready(self):
@@ -92,6 +93,7 @@ class AI(commands.Cog):
     @commands.command(name="reset_ai")
     async def reset_ai(self, ctx):
         self.memory.clear(str(ctx.author.id), str(ctx.channel.id))
+        self.memory.clear("chat", str(ctx.channel.id))  # shared group-chat thread
         await ctx.send("Memory reset, clean slate.")
 
     @commands.command()
@@ -138,19 +140,35 @@ class AI(commands.Cog):
         except Exception as e:
             await interaction.followup.send(f"Oops, something went wrong: {e}")
 
+    def _bot_exchange_allowed(self, channel_id, author_id, *, limit=3, window=60.0):
+        """Loop breaker: cap how many times we'll auto-reply to a given bot."""
+        import time
+
+        key = (channel_id, author_id)
+        count, start = self._bot_exchanges.get(key, (0, 0.0))
+        now = time.monotonic()
+        if now - start > window:
+            count, start = 0, now
+        if count >= limit:
+            return False
+        self._bot_exchanges[key] = (count + 1, start)
+        return True
+
     # ----- Bot-to-bot: if another bot @s me, banter back (e.g. Darwin) -------
     @commands.Cog.listener()
     async def on_message(self, message):
         if message.author.id == self.client.user.id:
             return
         if message.author.bot and self.client.user.mentioned_in(message):
+            if not self._bot_exchange_allowed(message.channel.id, message.author.id):
+                return  # hit the bot-to-bot cap; stay quiet to break the loop
             clean = message.clean_content.replace(f"@{self.client.user.display_name}", "").strip()
             if not clean:
                 return
             prompt = f"{message.author.display_name} says: {clean}"
             response = await self.brain.respond(
                 user="chat", channel=message.channel, guild=message.guild,
-                text=prompt, chat=True,
+                text=prompt, chat=True, mem_key="botchat",
             )
             await message.channel.send(f"<@{message.author.id}> {response}")
 

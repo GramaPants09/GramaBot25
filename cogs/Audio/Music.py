@@ -32,16 +32,21 @@ class Music(commands.Cog):
     def __init__(self, client):
         self.client = client
         self.queue = self.load_queue()
-        self.is_playing = False
-        self.voice_client = None
-        self.loop_song = False
-        self.loop_queue = False
-        self.volume = 0.5
-        self.current_song = None
+        # All runtime playback state is per-guild (keyed by int guild id) so
+        # multiple servers don't clobber each other. The active voice client is
+        # always read from ctx.voice_client / guild.voice_client, never cached.
+        self.is_playing = {}     # gid -> bool
+        self.loop_song = {}      # gid -> bool
+        self.loop_queue = {}     # gid -> bool
+        self.volumes = {}        # gid -> float
+        self.current_song = {}   # gid -> str
         self.local_queue = []
         self.local_audio_process = None
         self.local_paused = False
 
+
+    def _vol(self, gid):
+        return self.volumes.get(gid, 0.5)
 
     def load_queue(self):
         if os.path.exists(QUEUE_FILE):
@@ -116,9 +121,8 @@ class Music(commands.Cog):
         if vc and vc.is_connected():
             if vc.channel != target_channel:
                 await vc.move_to(target_channel)
-            self.voice_client = vc
         else:
-            self.voice_client = await target_channel.connect()
+            await target_channel.connect()
 
         return True
 
@@ -130,24 +134,40 @@ class Music(commands.Cog):
         return data['url'], data.get('title', 'Unknown Title'), data.get('thumbnail', '')
 
     async def play_next(self, ctx):
-        guild_id = str(ctx.guild.id)
-        if self.loop_song and self.current_song:
-            await self.play_song(ctx, self.current_song)
-        elif guild_id in self.queue and self.queue[guild_id]:
-            self.is_playing = True
-            self.current_song = self.queue[guild_id][0] if self.loop_queue else self.queue[guild_id].pop(0)
+        gid = ctx.guild.id
+        guild_id = str(gid)
+        if self.loop_song.get(gid) and self.current_song.get(gid):
+            await self.play_song(ctx, self.current_song[gid])
+        elif self.queue.get(guild_id):
+            self.is_playing[gid] = True
+            song = self.queue[guild_id][0] if self.loop_queue.get(gid) else self.queue[guild_id].pop(0)
+            self.current_song[gid] = song
             self.save_queue()
-            await self.play_song(ctx, self.current_song)
+            await self.play_song(ctx, song)
         else:
-            self.is_playing = False
-            await ctx.send(OutputText.output(ctx.guild.id ,"Queue is empty. Leaving voice channel."))
-            await self.voice_client.disconnect()
+            self.is_playing[gid] = False
+            await ctx.send(OutputText.output(gid, "Queue is empty. Leaving voice channel."))
+            if ctx.voice_client:
+                await ctx.voice_client.disconnect()
 
     async def play_song(self, ctx, query):
+        gid = ctx.guild.id
+        vc = ctx.voice_client
+        if vc is None:
+            self.is_playing[gid] = False
+            return
         try:
             stream_url, title, thumbnail = await self.get_stream_url(query)
         except Exception:
-            await ctx.send(OutputText.output(ctx.guild.id ,"Could not find the song."))
+            await ctx.send(OutputText.output(gid, "Could not find the song."))
+            # Ensure forward progress so a bad track can't loop forever.
+            if self.loop_song.get(gid):
+                self.loop_song[gid] = False
+                self.current_song[gid] = None
+            elif self.loop_queue.get(gid) and self.queue.get(str(gid)):
+                self.queue[str(gid)].pop(0)
+                self.save_queue()
+            await self.play_next(ctx)
             return
 
         def after_playing(error):
@@ -158,10 +178,11 @@ class Music(commands.Cog):
                 print(f"Error playing next song: {e}")
 
         source = discord.FFmpegPCMAudio(stream_url, **FFMPEG_OPTIONS)
-        self.voice_client.play(discord.PCMVolumeTransformer(source, volume=self.volume), after=after_playing)
+        vc.play(discord.PCMVolumeTransformer(source, volume=self._vol(gid)), after=after_playing)
 
         embed = discord.Embed(title="Now Playing", description=title, color=discord.Color.green())
-        embed.set_thumbnail(url=thumbnail)
+        if thumbnail:
+            embed.set_thumbnail(url=thumbnail)
         await ctx.send(embed=embed)
 
     @commands.command()
@@ -258,7 +279,7 @@ class Music(commands.Cog):
         self.queue.setdefault(guild_id, []).extend(queries)
         self.save_queue()
 
-        if not self.is_playing:
+        if not self.is_playing.get(ctx.guild.id):
             await self.play_next(ctx)
         else:
             await ctx.send(OutputText.output(ctx.guild.id, "Added to the queue!"))
@@ -284,29 +305,31 @@ class Music(commands.Cog):
 
     @commands.command()
     async def volume(self, ctx, volume: int):
+        gid = ctx.guild.id
         if ctx.voice_client and ctx.voice_client.source:
-            self.volume = volume / 100
-            ctx.voice_client.source.volume = self.volume
-            await ctx.send(OutputText.output(ctx.guild.id,f"Volume set to {volume}%"))
+            self.volumes[gid] = volume / 100
+            ctx.voice_client.source.volume = self.volumes[gid]
+            await ctx.send(OutputText.output(gid, f"Volume set to {volume}%"))
         else:
-            await ctx.send(OutputText.output(ctx.guild.id,"No audio playing."))
+            await ctx.send(OutputText.output(gid, "No audio playing."))
 
     @commands.command()
     async def loop(self, ctx, mode: str):
+        gid = ctx.guild.id
         if mode == "song":
-            self.loop_song = True
-            self.loop_queue = False
-            await ctx.send(OutputText.output(ctx.guild.id,"Looping current song."))
+            self.loop_song[gid] = True
+            self.loop_queue[gid] = False
+            await ctx.send(OutputText.output(gid, "Looping current song."))
         elif mode == "queue":
-            self.loop_queue = True
-            self.loop_song = False
-            await ctx.send(OutputText.output(ctx.guild.id,"Looping queue."))
+            self.loop_queue[gid] = True
+            self.loop_song[gid] = False
+            await ctx.send(OutputText.output(gid, "Looping queue."))
         elif mode == "off":
-            self.loop_song = False
-            self.loop_queue = False
-            await ctx.send(OutputText.output(ctx.guild.id,"Looping disabled."))
+            self.loop_song[gid] = False
+            self.loop_queue[gid] = False
+            await ctx.send(OutputText.output(gid, "Looping disabled."))
         else:
-            await ctx.send(OutputText.output(ctx.guild.id,"Invalid mode! Use 'song', 'queue', or 'off'."))
+            await ctx.send(OutputText.output(gid, "Invalid mode! Use 'song', 'queue', or 'off'."))
 
     @commands.command()
     async def pause(self, ctx):
@@ -327,17 +350,17 @@ class Music(commands.Cog):
     @commands.command()
     async def stop(self, ctx):
         if ctx.voice_client:
-            guild_id = str(ctx.guild.id)
+            gid = ctx.guild.id
             if ctx.voice_client.is_playing() or ctx.voice_client.is_paused():
                 ctx.voice_client.stop()
-            self.queue[guild_id] = []
+            self.queue[str(gid)] = []
             self.save_queue()
-            self.is_playing = False
-            self.current_song = None
+            self.is_playing[gid] = False
+            self.current_song[gid] = None
             await ctx.voice_client.disconnect()
-            await ctx.send(OutputText.output(ctx.guild.id,"Stopped playback and left voice channel."))
+            await ctx.send(OutputText.output(gid, "Stopped playback and left voice channel."))
         else:
-            await ctx.send(OutputText.output(ctx.guild.id,"I'm not in a voice channel."))
+            await ctx.send(OutputText.output(ctx.guild.id, "I'm not in a voice channel."))
 
     @commands.command()
     async def clear_queue(self, ctx):
@@ -574,50 +597,60 @@ class Music(commands.Cog):
     # Agent-facing helpers (driven by the AgentBrain tools, no ctx needed)
     # ------------------------------------------------------------------
     async def _agent_play_next(self, guild, text_channel):
-        gid = str(guild.id)
-        if self.loop_song and self.current_song:
-            song = self.current_song
-        elif self.queue.get(gid):
-            self.current_song = self.queue[gid][0] if self.loop_queue else self.queue[gid].pop(0)
-            self.save_queue()
-            song = self.current_song
-        else:
-            self.is_playing = False
-            vc = guild.voice_client
-            if vc:
-                await vc.disconnect()
-            return
-
-        self.is_playing = True
-        try:
-            stream_url, title, thumbnail = await self.get_stream_url(song)
-        except Exception:
-            if text_channel:
-                await text_channel.send(OutputText.output(guild.id, "Could not find the song."))
-            await self._agent_play_next(guild, text_channel)
-            return
-
+        gid_i = guild.id
+        gid = str(gid_i)
         vc = guild.voice_client
-        if vc is None:
-            self.is_playing = False
-            return
+        # Iterate (not recurse) past failures so a run of dead links can't blow
+        # the stack or wedge the player.
+        while True:
+            if self.loop_song.get(gid_i) and self.current_song.get(gid_i):
+                song = self.current_song[gid_i]
+            elif self.queue.get(gid):
+                song = self.queue[gid][0] if self.loop_queue.get(gid_i) else self.queue[gid].pop(0)
+                self.current_song[gid_i] = song
+                self.save_queue()
+            else:
+                self.is_playing[gid_i] = False
+                if vc:
+                    await vc.disconnect()
+                return
 
-        def after_playing(error):
-            fut = asyncio.run_coroutine_threadsafe(
-                self._agent_play_next(guild, text_channel), self.client.loop
-            )
+            self.is_playing[gid_i] = True
+            if vc is None:
+                self.is_playing[gid_i] = False
+                return
+
             try:
-                fut.result()
-            except Exception as e:
-                print(f"[agent] play_next error: {e}")
+                stream_url, title, thumbnail = await self.get_stream_url(song)
+            except Exception:
+                if text_channel:
+                    await text_channel.send(OutputText.output(gid_i, "Could not find the song."))
+                # Guarantee forward progress before retrying the next track.
+                if self.loop_song.get(gid_i):
+                    self.loop_song[gid_i] = False
+                    self.current_song[gid_i] = None
+                elif self.loop_queue.get(gid_i) and self.queue.get(gid):
+                    self.queue[gid].pop(0)
+                    self.save_queue()
+                continue
 
-        source = discord.FFmpegPCMAudio(stream_url, **FFMPEG_OPTIONS)
-        vc.play(discord.PCMVolumeTransformer(source, volume=self.volume), after=after_playing)
-        if text_channel:
-            embed = discord.Embed(title="Now Playing", description=title, color=discord.Color.green())
-            if thumbnail:
-                embed.set_thumbnail(url=thumbnail)
-            await text_channel.send(embed=embed)
+            def after_playing(error):
+                fut = asyncio.run_coroutine_threadsafe(
+                    self._agent_play_next(guild, text_channel), self.client.loop
+                )
+                try:
+                    fut.result()
+                except Exception as e:
+                    print(f"[agent] play_next error: {e}")
+
+            source = discord.FFmpegPCMAudio(stream_url, **FFMPEG_OPTIONS)
+            vc.play(discord.PCMVolumeTransformer(source, volume=self._vol(gid_i)), after=after_playing)
+            if text_channel:
+                embed = discord.Embed(title="Now Playing", description=title, color=discord.Color.green())
+                if thumbnail:
+                    embed.set_thumbnail(url=thumbnail)
+                await text_channel.send(embed=embed)
+            return  # success — the after-callback schedules the next track
 
     async def agent_play(self, guild, member, text_channel, query):
         if guild is None:
@@ -648,7 +681,7 @@ class Music(commands.Cog):
         self.save_queue()
 
         started = False
-        if not self.is_playing:
+        if not self.is_playing.get(guild.id):
             await self._agent_play_next(guild, text_channel)
             started = True
 
@@ -676,13 +709,13 @@ class Music(commands.Cog):
                 return "Resumed."
             return "Nothing to resume."
         if action == "stop":
-            gid = str(guild.id)
+            gid_i = guild.id
             if vc and (vc.is_playing() or vc.is_paused()):
                 vc.stop()
-            self.queue[gid] = []
+            self.queue[str(gid_i)] = []
             self.save_queue()
-            self.is_playing = False
-            self.current_song = None
+            self.is_playing[gid_i] = False
+            self.current_song[gid_i] = None
             if vc:
                 await vc.disconnect()
             return "Stopped and cleared the queue."
