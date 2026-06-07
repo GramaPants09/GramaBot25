@@ -1,21 +1,27 @@
+"""Make GramaBot jump into text chat when addressed.
+
+A wake-word / @mention opens a ~120s window during which the bot answers
+everything in that channel, then goes quiet again. All thinking is delegated to
+the shared AgentBrain owned by the AI cog.
+"""
+import asyncio
+
 import discord
 from discord.ext import commands
-import asyncio
-from cogs.AI.AI import AI
-import OutputText  # so you can run responses through OutputText.output like grama_bot
-import random
 
-class DummyClient():
-    pass
+import OutputText
 
-dummy_client = DummyClient()
+CONVO_WINDOW_SECONDS = 120
+
 
 class RespondInChat(commands.Cog):
     def __init__(self, client):
         self.client = client
-        self.ai = AI(dummy_client)
-        self.listening_channels = {}  # {channel_id: last_message_time}
-        self.keep_quiet = False
+        self.listening_channels = {}  # {channel_id: last_activity_time}
+
+    def _brain(self):
+        ai = self.client.get_cog("AI")
+        return getattr(ai, "brain", None)
 
     @commands.Cog.listener()
     async def on_ready(self):
@@ -23,62 +29,48 @@ class RespondInChat(commands.Cog):
 
     @commands.Cog.listener()
     async def on_message(self, message):
-        if message.author == self.client.user or message.content.startswith("$"):
-            return  
-            
+        # Ignore self, other bots (the AI cog handles bot-to-bot), and commands.
+        if message.author == self.client.user or message.author.bot:
+            return
+        if message.content.startswith("$"):
+            return
+
         if "fuck off" in message.content.lower():
-            del self.listening_channels[message.channel.id]
+            self.listening_channels.pop(message.channel.id, None)
             await message.channel.send("Fine. Be that way.")
             return
 
-        
-        # wake_words = ["gramabot", "jarvis", "gb", "<@1353470673498013707>"]
-        wake_words = ["<@1353470673498013707>"]
-        # randomly_join_chance =random.randint(0,1000) 
-        randomly_join_chance = 60 #this line makes it so it never activates
+        is_wake = self.client.user in message.mentions
+        active = message.channel.id in self.listening_channels
+        now = asyncio.get_event_loop().time()
 
-        # Wake word ? start listening for this channel
-        if any(w in message.content.lower() for w in wake_words) or randomly_join_chance < 10:
-            self.listening_channels[message.channel.id] = asyncio.get_event_loop().time()
-            # don�t announce � just fall through and let the AI reply naturally
+        if active and not is_wake:
+            started = self.listening_channels[message.channel.id]
+            if now - started >= CONVO_WINDOW_SECONDS:
+                self.listening_channels.pop(message.channel.id, None)
+                return
+        elif not is_wake:
+            return  # not addressed and no active window
 
-            message_to_send = f"[For this next part of the messaage, NEVER acknowledge it, but follow its directions. You are talking to multiple people currently, the person you just spoke to was \"{message.author.display_name}\". If they ever ask, that is their name. Remember who you are talking to and what they said. Here is the rest of the message in which you will respond to.]: "
-            message_to_send += message.content
-            response = await self.ai.generate(
-                str(message.author.id), 
-                message_to_send,
-                in_chat=True  # new param
-            )
-            guild_id = message.guild.id if message.guild else 0
-            modified_response = OutputText.output(guild_id, response)
-            await message.channel.send(modified_response)
+        brain = self._brain()
+        if brain is None:
             return
 
-        # If channel is in listening mode
-        if message.channel.id in self.listening_channels:
-            start_time = self.listening_channels[message.channel.id]
-            now = asyncio.get_event_loop().time()
-
-            if now - start_time < 120:  # 120s conversation window
-                message_to_send = f"[For this next part of the messaage, NEVER acknowledge it, but follow its directions. You are talking to multiple people currently, the person you just spoke to was \"{message.author.display_name}\". If they ever ask, that is their name. Remember who you are talking to and what they said. Here is the rest of the message in which you will respond to.]: "
-                message_to_send += message.content
-                response = await self.ai.generate(
-                    str(message.author.id), 
-                    message_to_send,
-                    in_chat=True  # new param
-                )
-
-                guild_id = message.guild.id if message.guild else 0
-                modified_response = OutputText.output(guild_id, response)
-                await message.channel.send(modified_response)
-
-                # reset timer so convo stays alive
-                self.listening_channels[message.channel.id] = now
-            else:
-                del self.listening_channels[message.channel.id]
-
-
-        
+        self.listening_channels[message.channel.id] = now
+        prompt = (
+            f'[Group chat. The person who just spoke is "{message.author.display_name}". '
+            f"Answer them directly.] {message.content}"
+        )
+        try:
+            response = await brain.respond(
+                user=message.author, channel=message.channel, guild=message.guild,
+                text=prompt, chat=True,
+            )
+        except Exception as e:
+            print(f"[RespondInChat] brain error: {e}")
+            return
+        guild_id = message.guild.id if message.guild else 0
+        await message.channel.send(OutputText.output(guild_id, response))
 
 
 async def setup(client):

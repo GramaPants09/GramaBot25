@@ -64,6 +64,19 @@ class Memory:
         ).fetchall()
         return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
 
+    def clear(self, user_id: str, channel_id: str) -> int:
+        """Wipe turns + summary for one (user, channel). Returns rows deleted."""
+        cur = self._conn.execute(
+            "DELETE FROM turns WHERE user_id = ? AND channel_id = ?",
+            (str(user_id), str(channel_id)),
+        )
+        self._conn.execute(
+            "DELETE FROM summaries WHERE user_id = ? AND channel_id = ?",
+            (str(user_id), str(channel_id)),
+        )
+        self._conn.commit()
+        return cur.rowcount
+
     def get_summary(self, user_id: str, channel_id: str) -> str | None:
         row = self._conn.execute(
             "SELECT summary FROM summaries WHERE user_id = ? AND channel_id = ?",

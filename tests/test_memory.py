@@ -53,6 +53,18 @@ def test_import_json(tmp_path):
     ]
 
 
+def test_clear_removes_turns_and_summary(tmp_path):
+    mem = Memory(db_path=str(tmp_path / "b.db"))
+    mem.add_turn("u", "c", "user", "hi")
+    mem.set_summary("u", "c", "s")
+    mem.add_turn("u", "other", "user", "keep me")
+    removed = mem.clear("u", "c")
+    assert removed == 1
+    assert mem.history("u", "c") == []
+    assert mem.get_summary("u", "c") is None
+    assert mem.history("u", "other") == [{"role": "user", "content": "keep me"}]
+
+
 def test_import_json_missing_file_is_noop(tmp_path):
     db = str(tmp_path / "b.db")
     n = Memory.import_json(str(tmp_path / "nope.json"), db)
