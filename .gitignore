@@ -22,3 +22,11 @@ cogs/jsonfiles/*
 # Logs and temp files
 *.log
 *.tmp
+
+# Dev test env (not part of the bot)
+.devvenv/
+.pytest_cache/
+tests/__pycache__/
+
+# Agent brain DB
+data/
