@@ -1,22 +1,24 @@
-"""AgentBrain — a bounded Claude tool-use loop.
+"""AgentBrain — a bounded agentic tool-use loop over Claude or OpenRouter.
 
 The brain takes a piece of user text, builds the conversation from memory +
-persona, and runs Claude in a loop: the model may emit ``tool_use`` blocks,
-which we dispatch to registered handlers and feed back as ``tool_result``
-blocks, repeating until the model returns a plain text answer (or we hit the
-iteration cap).
+persona, and runs the model in a loop: it may request tools, which we dispatch
+to registered handlers and feed back, repeating until it returns a plain text
+answer (or we hit the iteration cap).
 
-Design notes
-------------
-- The Anthropic SDK is imported lazily so this module loads without a key and
-  is unit-testable by injecting a fake client.
-- Destructive/"gated" tools must clear ``ToolContext.request_approval`` before
-  they run; without an approval callback a gated tool is refused.
-- If no ``ANTHROPIC_API_KEY`` is configured, ``respond`` falls back to a simple
-  keyless OpenRouter chat (no tools) so the bot still talks.
+Two providers are supported behind one seam (the two wire formats differ, so
+each has its own loop):
+- **anthropic** — the Anthropic SDK, ``tool_use``/``tool_result`` content blocks.
+- **openrouter** — the OpenAI-compatible API, ``tool_calls`` + ``role:"tool"``
+  results (arguments arrive as a JSON *string*).
+
+Provider is chosen by ``BRAIN_PROVIDER`` (``anthropic``|``openrouter``); if unset
+it auto-detects from which key is present. Both SDKs are imported lazily so the
+module loads (and unit-tests) without any key, by injecting a fake client.
 """
 from __future__ import annotations
 
+import asyncio
+import json
 import os
 import re
 from dataclasses import dataclass
@@ -29,6 +31,7 @@ from cogs.AI.tools import registry
 DEFAULT_MODEL = "claude-sonnet-4-6"
 FAST_MODEL = "claude-haiku-4-5"
 OPENROUTER_MODEL = "nvidia/nemotron-3-super-120b-a12b:free"
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 
 @dataclass
@@ -51,6 +54,7 @@ class AgentBrain:
         fast_model: str | None = None,
         max_iterations: int = 8,
         anthropic_client=None,
+        openrouter_client=None,
         api_key: str | None = None,
     ):
         self.client = client
@@ -61,9 +65,30 @@ class AgentBrain:
         self.fast_model = fast_model or os.getenv("ANTHROPIC_FAST_MODEL") or FAST_MODEL
         self.max_iterations = max_iterations
         self._anthropic = anthropic_client
+        self._openrouter = openrouter_client
         self._api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
 
     # ------------------------------------------------------------------ clients
+    def _provider(self) -> str:
+        p = (os.getenv("BRAIN_PROVIDER") or "").strip().lower()
+        if p in ("openrouter", "anthropic"):
+            return p
+        if self._api_key:
+            return "anthropic"
+        if self._openrouter_key():
+            return "openrouter"
+        return "none"
+
+    @staticmethod
+    def _openrouter_key() -> str:
+        return (
+            os.getenv("OPEN_ROUTER_API_KEY")
+            or os.getenv("OPENROUTER_API_KEY")
+            or os.getenv("GramaBot_API_KEY")
+            or os.getenv("GROQ_API_KEY")
+            or ""
+        ).strip().strip('"').strip("'")
+
     def _get_anthropic(self):
         if self._anthropic is not None:
             return self._anthropic
@@ -73,6 +98,17 @@ class AgentBrain:
 
         self._anthropic = AsyncAnthropic(api_key=self._api_key)
         return self._anthropic
+
+    def _get_openrouter(self):
+        if self._openrouter is not None:
+            return self._openrouter
+        key = self._openrouter_key()
+        if not key:
+            return None
+        from openai import OpenAI
+
+        self._openrouter = OpenAI(base_url=OPENROUTER_BASE_URL, api_key=key)
+        return self._openrouter
 
     # ------------------------------------------------------------------- public
     async def respond(
@@ -101,13 +137,18 @@ class AgentBrain:
             voice=voice, request_approval=request_approval,
         )
 
-        client = self._get_anthropic()
-        if client is None:
-            answer = await self._openrouter_fallback(system, messages)
-            self.memory.add_turn(mem_user, channel_id, "assistant", answer)
-            return answer
+        provider = self._provider()
+        if provider == "openrouter":
+            answer = await self._run_loop_openrouter(system, messages, ctx)
+        elif provider == "anthropic":
+            client = self._get_anthropic()
+            answer = await self._run_loop(client, system, messages, ctx)
+        elif self._openrouter_key():
+            answer = await self._run_loop_openrouter(system, messages, ctx)
+        else:
+            answer = ("My brain's offline, guv — set ANTHROPIC_API_KEY or "
+                      "OPEN_ROUTER_API_KEY in the .env.")
 
-        answer = await self._run_loop(client, system, messages, ctx)
         self.memory.add_turn(mem_user, channel_id, "assistant", answer)
         return answer
 
@@ -182,34 +223,62 @@ class AgentBrain:
         except Exception as e:
             return f"Tool '{name}' failed: {e}"
 
-    # ---------------------------------------------------------------- fallback
-    async def _openrouter_fallback(self, system, messages) -> str:
-        """Keyless-Claude fallback: a plain OpenRouter chat with no tools."""
-        import asyncio
+    # ------------------------------------------------------ OpenRouter tool loop
+    async def _run_loop_openrouter(self, system, messages, ctx: ToolContext) -> str:
+        """Agentic loop over the OpenAI-compatible OpenRouter API.
 
-        key = (
-            os.getenv("OPEN_ROUTER_API_KEY")
-            or os.getenv("GramaBot_API_KEY")
-            or os.getenv("GROQ_API_KEY")
-            or ""
-        ).strip().strip('"').strip("'")
-        if not key:
-            return ("My brain's offline, guv — no ANTHROPIC_API_KEY and no OpenRouter "
-                    "key set. Sort the .env out.")
-        try:
-            from openai import OpenAI
+        Differs from the Anthropic loop: tool calls come back on
+        ``message.tool_calls`` with ``arguments`` as a JSON *string*, and results
+        are appended as ``role:"tool"`` messages.
+        """
+        client = self._get_openrouter()
+        if client is None:
+            return ("My brain's offline, guv — set OPEN_ROUTER_API_KEY (or "
+                    "ANTHROPIC_API_KEY) in the .env.")
 
-            oa = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=key)
-            convo = [{"role": "system", "content": system}] + [
-                m for m in messages if isinstance(m.get("content"), str)
-            ]
-            resp = await asyncio.to_thread(
-                oa.chat.completions.create,
-                model=OPENROUTER_MODEL, messages=convo, max_tokens=500,
-            )
-            return self._clean(resp.choices[0].message.content or "")
-        except Exception as e:
-            return f"Brain error (fallback): {e}"
+        model = os.getenv("OPENROUTER_MODEL", OPENROUTER_MODEL)
+        tools = registry.openai_schemas(include_gated=ctx.request_approval is not None)
+        # OpenAI dialect: system lives in the message list (content is plain str).
+        convo = [{"role": "system", "content": system}] + [
+            m for m in messages if isinstance(m.get("content"), str)
+        ]
+        last_text = ""
+        for _ in range(self.max_iterations):
+            kwargs = dict(model=model, messages=convo, max_tokens=2048)
+            if tools:
+                kwargs["tools"] = tools
+            try:
+                resp = await asyncio.to_thread(client.chat.completions.create, **kwargs)
+            except Exception as e:
+                return f"Brain error (OpenRouter): {e}"
+
+            msg = resp.choices[0].message
+            text = self._clean(msg.content or "")
+            if text:
+                last_text = text
+            tool_calls = getattr(msg, "tool_calls", None)
+            if not tool_calls:
+                return last_text or "..."
+
+            # Append the assistant turn (with its tool_calls) before the results.
+            convo.append({
+                "role": "assistant",
+                "content": msg.content or "",
+                "tool_calls": [
+                    {"id": tc.id, "type": "function",
+                     "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+                    for tc in tool_calls
+                ],
+            })
+            for tc in tool_calls:
+                try:
+                    args = json.loads(tc.function.arguments or "{}")
+                except (json.JSONDecodeError, TypeError):
+                    args = {}
+                result = await self._run_tool(tc.function.name, args, ctx)
+                convo.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+
+        return last_text or "Bloody hell, I lost the thread there. Try again, mate."
 
     @staticmethod
     def _clean(text: str) -> str:

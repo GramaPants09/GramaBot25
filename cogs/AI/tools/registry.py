@@ -67,3 +67,19 @@ def anthropic_schemas(include_gated: bool = True) -> list[dict]:
         for t in _REGISTRY.values()
         if include_gated or not t.gated
     ]
+
+
+def openai_schemas(include_gated: bool = True) -> list[dict]:
+    """Return tool definitions in OpenAI / OpenRouter ``tools=[...]`` format."""
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": t.name,
+                "description": t.description,
+                "parameters": t.schema,
+            },
+        }
+        for t in _REGISTRY.values()
+        if include_gated or not t.gated
+    ]

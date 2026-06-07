@@ -130,8 +130,75 @@ async def test_gated_tools_hidden_when_no_approval(tmp_path):
     assert "gated_hidden_test" not in names
 
 
+# --- OpenRouter (OpenAI-dialect) fakes ---
+class _OAFunc:
+    def __init__(self, name, arguments):
+        self.name = name
+        self.arguments = arguments
+
+
+class _OAToolCall:
+    def __init__(self, id, name, arguments):
+        self.id = id
+        self.type = "function"
+        self.function = _OAFunc(name, arguments)
+
+
+class _OAMessage:
+    def __init__(self, content=None, tool_calls=None):
+        self.content = content
+        self.tool_calls = tool_calls
+
+
+class _OAResp:
+    def __init__(self, message):
+        self.choices = [type("C", (), {"message": message})()]
+
+
+class _FakeCompletions:
+    def __init__(self, script):
+        self.script = list(script)
+        self.calls = []
+
+    def create(self, **kw):
+        self.calls.append(kw)
+        return self.script.pop(0)
+
+
+class FakeOpenAI:
+    def __init__(self, script):
+        self.chat = type("Chat", (), {"completions": _FakeCompletions(script)})()
+
+
+@pytest.mark.asyncio
+async def test_openrouter_tool_loop(tmp_path, monkeypatch):
+    monkeypatch.setenv("BRAIN_PROVIDER", "openrouter")
+    monkeypatch.setenv("OPEN_ROUTER_API_KEY", "x")
+    ran = {}
+
+    @registry.tool("or_echo", "echo", {"type": "object", "properties": {"text": {"type": "string"}}})
+    async def _e(ctx, text):
+        ran["text"] = text
+        return f"got:{text}"
+
+    script = [
+        _OAResp(_OAMessage(content=None, tool_calls=[_OAToolCall("c1", "or_echo", '{"text": "oi"}')])),
+        _OAResp(_OAMessage(content="done then", tool_calls=None)),
+    ]
+    fake = FakeOpenAI(script)
+    brain = AgentBrain(memory=Memory(db_path=str(tmp_path / "b.db")), openrouter_client=fake)
+
+    out = await brain.respond(user="u", channel="c", guild=None, text="say oi")
+    assert out == "done then"
+    assert ran["text"] == "oi"  # JSON-string args parsed correctly
+    # the tool result must be fed back as a role:"tool" message
+    second = fake.chat.completions.calls[1]["messages"]
+    assert any(m.get("role") == "tool" and "got:oi" in m.get("content", "") for m in second)
+
+
 @pytest.mark.asyncio
 async def test_no_key_uses_fallback_message(tmp_path, monkeypatch):
+    monkeypatch.delenv("BRAIN_PROVIDER", raising=False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("OPEN_ROUTER_API_KEY", raising=False)
     monkeypatch.delenv("GramaBot_API_KEY", raising=False)
